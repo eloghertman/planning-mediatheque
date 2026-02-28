@@ -693,7 +693,21 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             slot_alerts = []
 
             # ══ PASSE A : Vérifier chaque agent du planning type ══
-            for section in SECTIONS:
+            # On trie les sections par nombre de candidats disponibles CROISSANT
+            # (section la plus difficile à remplir = traitée en premier)
+            # pour éviter qu'un agent unique soit "volé" par une section moins contrainte
+            def count_candidates(section):
+                return sum(
+                    1 for a in eligible
+                    if section in affectations.get(a, [])
+                    and agent_available(a, jour, cs, ce, date_str, horaires_agents, evenements)
+                    and sp_count.get(a, 0) + slot_min <= sp_max_min.get(a, 99*60)
+                    and (not is_vacataire(a) or vac_day_sp.get(a, 0) + slot_min <= VAC_MAX_DAY_MIN)
+                )
+            sections_ordered = sorted(SECTIONS, key=count_candidates)
+            final_by_section = {}  # section -> agents réellement assignés (mis à jour au fil des sections)
+
+            for section in sections_ordered:
                 final_agents = []
                 for agent in assignment[section]:
 
@@ -753,10 +767,11 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         # Garder l'agent du planning type — aucune raison de le changer
                         final_agents.append(agent)
                     else:
-                        # Chercher remplaçant
+                        # Chercher remplaçant — exclure agents déjà assignés ce créneau
+                        # (dans les sections déjà traitées ET dans final_agents en cours)
                         excl = set(final_agents) | set(
-                            a for s2 in SECTIONS
-                            for a in assignment.get(s2, []) if s2 != section)
+                            a for s2 in sections_ordered
+                            for a in final_by_section.get(s2, []) if s2 != section)
                         repl = find_best_replacement(
                             section=section, jour=jour, cs=cs, ce=ce,
                             date_str=date_str, eligible=eligible,
@@ -773,7 +788,25 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             final_agents.append(repl)
                         # Si pas de remplaçant → sera traité en passe B
 
-                assignment[section] = final_agents
+                # Dédoublonner (éviter même agent 2x dans la section)
+                seen_agents = []
+                for a in final_agents:
+                    if a not in seen_agents:
+                        seen_agents.append(a)
+                assignment[section] = seen_agents
+                final_by_section[section] = seen_agents  # enregistrer pour exclusion des sections suivantes
+
+            # ══ NETTOYAGE : un agent ne peut être que dans UNE seule section par créneau ══
+            # Si un agent apparaît dans plusieurs sections, on le garde dans la première (priorité)
+            # et on déclenche la recherche d'un remplaçant pour les suivantes
+            agents_assigned_this_slot = set()
+            for section in SECTIONS:
+                clean = []
+                for agent in assignment[section]:
+                    if agent not in agents_assigned_this_slot:
+                        clean.append(agent)
+                        agents_assigned_this_slot.add(agent)
+                assignment[section] = clean
 
             # ══ PASSE B : S'assurer que chaque section a 1 agent (contrainte dure) ══
             for section in ['RDC', 'Adulte', 'MF']:
@@ -793,6 +826,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     )
                     if repl:
                         assignment[section] = [repl]
+                        final_by_section[section] = [repl]
                     else:
                         slot_alerts.append(f"ALERTE — {section} : aucun agent disponible")
 
@@ -804,6 +838,13 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             else:
                 j_needs = int(bj.get(jour, 1))
             j_needs = max(j_needs, 0)
+
+            # Dédoublonner Jeunesse (bug: même agent apparaît 2x)
+            seen = []
+            for a in assignment.get('Jeunesse', []):
+                if a not in seen:
+                    seen.append(a)
+            assignment['Jeunesse'] = seen
 
             current_j_count = len(assignment.get('Jeunesse', []))
             if current_j_count < j_needs:

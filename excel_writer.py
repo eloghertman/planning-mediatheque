@@ -374,67 +374,59 @@ def write_week_sheet(wb, week_data, metadata):
                 day_formulas[jour] = formula
                 day_values[jour]   = total_min
 
-        # Écrire les cellules de jour avec formules
+        # Écrire les cellules de jour avec formules dynamiques
         total_col_refs = []
         for j_col_offset, jour in enumerate(JOURS_SP):
-            col = j_col_offset + 3
+            col     = j_col_offset + 3
             formula = day_formulas.get(jour)
             val_min = day_values.get(jour, 0)
+            cell    = ws.cell(row=row, column=col)
 
-            if date := week_dates.get(jour):
-                cell = ws.cell(row=row, column=col)
+            if week_dates.get(jour) is not None:
+                bg_c = 'FFF9C4' if (jour == 'Samedi' and val_min > 0) else                        (C['row_alt2'] if val_min > 0 else bg)
+                cell.fill      = _fill(bg_c)
+                cell.font      = _font(size=10, bold=val_min > 0)
+                cell.alignment = _aln()
+                cell.border    = _brd()
                 if formula:
-                    cell.value = formula
-                    # Format heure
-                    from openpyxl.styles import numbers
-                else:
-                    cell.value = f"{val_min//60}h{val_min%60:02d}" if val_min == 0 else None
-                    cell.value = "—" if val_min == 0 else f"{val_min//60}h{val_min%60:02d}"
-
-                bg_c = 'FFF9C4' if (jour == 'Samedi' and val_min > 0) else \
-                       (C['row_alt2'] if val_min > 0 else bg)
-                _set(cell, bg=bg_c,
-                     fnt=_font(size=10, bold=val_min > 0),
-                     aln=_aln(), brd=_brd())
-                if formula:
-                    # On stocke la référence pour la formule totale
+                    cell.value = formula   # formule =ESTNUM(CHERCHE(...))
                     total_col_refs.append(get_column_letter(col) + str(row))
+                else:
+                    cell.value = "—"
             else:
-                cell = ws.cell(row=row, column=col)
-                _set(cell, value='—', bg=bg,
-                     fnt=_font(size=9, color=C['gray_txt']), aln=_aln(), brd=_brd())
+                cell.value     = '—'
+                cell.fill      = _fill(bg)
+                cell.font      = _font(size=9, color=C['gray_txt'])
+                cell.alignment = _aln()
+                cell.border    = _brd()
 
-        # Total semaine (somme des colonnes jour)
-        total_cell = ws.cell(row=row, column=8)
-        if total_col_refs:
-            total_formula = "=" + "+".join(total_col_refs)
-            total_cell.value = total_formula
-        else:
-            total_min = sum(day_values.values())
-            total_cell.value = f"{total_min//60}h{total_min%60:02d}"
-
-        # Couleur total selon min/max SP
+        # Total semaine : formule = somme des colonnes jour
+        total_cell    = ws.cell(row=row, column=8)
         total_min_val = sum(day_values.values())
-        mm = sp_minmax_data.get(agent, {})
+        mm            = sp_minmax_data.get(agent, {})
         is_samedi_week = 'Samedi' in week_dates
         min_sp = (mm.get('Min_MarSam', 0) if is_samedi_week else mm.get('Min_MarVen', 0)) * 60
         max_sp = (mm.get('Max_MarSam', 99) if is_samedi_week else mm.get('Max_MarVen', 99)) * 60
 
+        if total_col_refs:
+            total_cell.value = "=" + "+".join(total_col_refs)
+        else:
+            total_cell.value = 0
+
         if total_min_val < min_sp:
             total_bg = C['sp_alert']
-            alert_note = f"⚠️ {total_min_val//60}h{total_min_val%60:02d} / min {int(min_sp)//60}h{int(min_sp)%60:02d}"
+            fnt_col  = C['alert_txt']
         elif total_min_val > max_sp:
             total_bg = C['sp_warn']
-            alert_note = f"⚠️ {total_min_val//60}h{total_min_val%60:02d} / max {int(max_sp)//60}h{int(max_sp)%60:02d}"
+            fnt_col  = 'E67E22'
         else:
             total_bg = C['sp_ok']
-            alert_note = f"{total_min_val//60}h{total_min_val%60:02d}"
+            fnt_col  = '1E8449'
 
-        _set(total_cell,
-             bg=total_bg,
-             fnt=_font(bold=True, size=10,
-                       color=C['alert_txt'] if total_min_val < min_sp else '1E8449'),
-             aln=_aln(), brd=_brd())
+        total_cell.fill      = _fill(total_bg)
+        total_cell.font      = _font(bold=True, size=10, color=fnt_col)
+        total_cell.alignment = _aln()
+        total_cell.border    = _brd()
 
         ws.row_dimensions[row].height = 18
         row += 1
