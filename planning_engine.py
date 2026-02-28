@@ -19,6 +19,10 @@ from collections import defaultdict
 # ─────────────────────────────────────────────
 
 def hm_to_min(val):
+    """
+    Convertit en minutes depuis minuit.
+    Gère : datetime.time, timedelta, '9h', '9h30', '9:30', '09:30', '9h30m', etc.
+    """
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     if hasattr(val, 'hour'):
@@ -27,11 +31,15 @@ def hm_to_min(val):
         return int(val.total_seconds()) // 60
     if isinstance(val, str):
         val = val.strip()
-        if not val or val == 'nan':
+        if not val or val.lower() == 'nan':
             return None
-        parts = val.replace('H', ':').replace('h', ':').split(':')
+        # Normaliser : remplacer H/h par :, supprimer les 'm' finaux
+        normalized = val.lower().replace('h', ':').replace('m', '').rstrip(':')
+        parts = normalized.split(':')
         try:
-            return int(parts[0]) * 60 + (int(parts[1]) if len(parts) >= 2 else 0)
+            h = int(parts[0]) if parts[0] else 0
+            m = int(parts[1]) if len(parts) >= 2 and parts[1] else 0
+            return h * 60 + m
         except:
             return None
     return None
@@ -156,6 +164,69 @@ def parse_roulement_samedi(data):
             result[agent] = val
     return result
 
+# Dictionnaire mois texte → numéro
+MOIS_TEXTE_MAP = {
+    'janvier':1,'février':2,'fevrier':2,'mars':3,'avril':4,'mai':5,'juin':6,
+    'juillet':7,'août':8,'aout':8,'septembre':9,'octobre':10,'novembre':11,
+    'décembre':12,'decembre':12
+}
+JOURS_TEXTE = {'lundi','mardi','mercredi','jeudi','vendredi','samedi','dimanche'}
+
+def parse_date_flexible(val, annee):
+    """Parse une date sous toutes ses formes, y compris 'Samedi 7 mars'."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, datetime):
+        return val
+    try:
+        ts = pd.Timestamp(val)
+        if not pd.isna(ts):
+            return ts.to_pydatetime()
+    except:
+        pass
+    s = str(val).strip().lower()
+    if not s or s == 'nan':
+        return None
+    # Retirer le jour de la semaine ("samedi 7 mars" → "7 mars")
+    for j in JOURS_TEXTE:
+        if s.startswith(j):
+            s = s[len(j):].strip()
+            break
+    # "7 mars", "07 mars 2026"
+    parts = s.replace(',', ' ').split()
+    if len(parts) >= 2:
+        try:
+            jour_num = int(parts[0])
+            mois_nom = parts[1].rstrip('.')
+            mois_num = MOIS_TEXTE_MAP.get(mois_nom)
+            if mois_num:
+                an = int(parts[2]) if len(parts) >= 3 else annee
+                return datetime(an, mois_num, jour_num)
+        except:
+            pass
+    # Formats numériques
+    for fmt in ('%d/%m/%Y', '%d/%m/%y', '%Y-%m-%d', '%d/%m'):
+        try:
+            d = datetime.strptime(s, fmt)
+            if d.year == 1900:
+                d = d.replace(year=annee)
+            return d
+        except:
+            pass
+    return None
+
+def split_agents_cell(cell_value):
+    """
+    Découpe une cellule agents en liste.
+    Gère les séparateurs ; et les espaces autour.
+    Ex: 'Anne-Françoise ; Guillaume ; Macha' → ['Anne-Françoise', 'Guillaume', 'Macha']
+    """
+    if not cell_value or str(cell_value).strip() in ('nan', '', '-'):
+        return []
+    raw = str(cell_value).strip()
+    parts = raw.split(';')
+    return [p.strip() for p in parts if p.strip() and p.strip().lower() != 'nan']
+
 def parse_evenements(data, mois, annee):
     df = data['Événements']
     result = defaultdict(list)
@@ -163,23 +234,23 @@ def parse_evenements(data, mois, annee):
         date_val = row.iloc[0]
         if not pd.notna(date_val):
             continue
-        try:
-            d = date_val if isinstance(date_val, datetime) else pd.to_datetime(date_val)
-            if d.month != mois or d.year != annee:
-                continue
-        except:
+        d = parse_date_flexible(date_val, annee)
+        if d is None or d.month != mois or d.year != annee:
             continue
         debut = hm_to_min(row.iloc[1]) if pd.notna(row.iloc[1]) else None
         fin   = hm_to_min(row.iloc[2]) if pd.notna(row.iloc[2]) else None
         nom   = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else None
         if not nom or nom == 'nan' or debut is None:
             continue
-        agents = [str(row.iloc[i]).strip() for i in range(4, min(11, len(row)))
-                  if pd.notna(row.iloc[i]) and str(row.iloc[i]).strip() not in ('nan', '')]
+        # Chaque cellule agents peut contenir plusieurs noms séparés par ;
+        agents = []
+        for i in range(4, min(12, len(row))):
+            if pd.notna(row.iloc[i]):
+                agents.extend(split_agents_cell(row.iloc[i]))
         result[d.strftime('%Y-%m-%d')].append({
-            'debut': debut,
-            'fin':   fin if fin else debut + 60,
-            'nom':   nom,
+            'debut':  debut,
+            'fin':    fin if fin else debut + 60,
+            'nom':    nom,
             'agents': agents,
         })
     return dict(result)
