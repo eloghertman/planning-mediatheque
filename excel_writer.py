@@ -366,7 +366,7 @@ def write_week_sheet(wb, week_data, metadata):
                     cell_ref   = f"{col_letter}{r}"
                     # ISNUMBER(SEARCH()) pour gestion du nom partiel dans cellule multi-agents
                     formula_parts.append(
-                        f'ISNUMBER(SEARCH("{agent}",{cell_ref}))*{dur}'
+                        f'ESTNUM(CHERCHE("{agent}";{cell_ref}))*{dur}'
                     )
                     total_min += dur
 

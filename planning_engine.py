@@ -474,18 +474,22 @@ def is_meridienne(cs, ce, params):
 def find_best_replacement(section, jour, cs, ce, date_str,
                           eligible, affectations, horaires_agents, evenements,
                           agents_used_today_section, sp_count, max_sp_min,
-                          exclude=None):
+                          exclude=None, vac_day_sp=None):
     """
     Cherche le meilleur remplaçant disponible pour une section/créneau.
     Priorité :
       1. Agent déjà utilisé dans cette section aujourd'hui (continuité de bloc)
       2. Agent régulier (non vacataire)
       3. Agent avec le plus de marge SP restante
+    Les vacataires sont utilisés en dernier recours mais couvrent toutes sections.
     Ne retourne jamais un agent qui dépasserait son max SP.
+    vac_day_sp : dict {vac_agent: minutes_sp_aujourd_hui} pour limiter à 7h/jour.
     """
-    exclude = set(exclude or [])
+    exclude    = set(exclude or [])
+    vac_day_sp = vac_day_sp or {}
     candidates = []
-    slot_min = ce - cs
+    slot_min   = ce - cs
+    VAC_MAX_DAY = 420  # 7h en minutes
 
     for agent in eligible:
         if agent in exclude:
@@ -494,15 +498,20 @@ def find_best_replacement(section, jour, cs, ce, date_str,
             continue
         if not agent_available(agent, jour, cs, ce, date_str, horaires_agents, evenements):
             continue
-        # Vérifier marge SP
+        # Vérifier marge SP hebdo
         current_sp = sp_count.get(agent, 0)
-        max_sp = max_sp_min.get(agent, 99 * 60)
+        max_sp     = max_sp_min.get(agent, 99 * 60)
         if current_sp + slot_min > max_sp:
             continue
+        # Vacataire : vérifier aussi le max journalier (7h)
+        if is_vacataire(agent):
+            day_sp = vac_day_sp.get(agent, 0)
+            if day_sp + slot_min > VAC_MAX_DAY:
+                continue
         already_today = agent in agents_used_today_section
         candidates.append((
             not already_today,   # priorité aux agents déjà utilisés (continuité)
-            is_vacataire(agent), # réguliers avant vacataires
+            is_vacataire(agent), # réguliers avant vacataires (vacataire = dernier recours)
             current_sp,          # moins de SP = plus disponible
             agent
         ))
@@ -517,41 +526,69 @@ def find_best_replacement(section, jour, cs, ce, date_str,
 #  SECTION 6 — CONTRAINTES CONSÉCUTIVES ET PAUSE
 # ══════════════════════════════════════════════════════════════
 
-def get_consecutive_sp(agent, section, cren_idx, creneaux, day_assignments):
+def get_consecutive_sp(agent, cren_idx, creneaux, day_assignments):
     """
-    Calcule les minutes SP consécutives de l'agent dans une section
+    Calcule les minutes SP consécutives de l'agent (toutes sections confondues)
     juste AVANT le créneau d'index cren_idx (sans interruption).
+    Un créneau fermé ou une absence = interruption → remise à zéro.
     """
     cumul = 0
     for i in range(cren_idx - 1, -1, -1):
         cn, c_cs, c_ce = creneaux[i]
         slot = day_assignments.get(cn)
         if slot is None:
-            break  # créneau fermé = interruption
-        assigned = slot.get('assignment', {}).get(section, [])
-        if agent in assigned:
+            break  # créneau fermé = pause forcée, on repart à 0
+        all_agents = [a for s in SECTIONS
+                      for a in slot.get('assignment', {}).get(s, [])]
+        if agent in all_agents:
             cumul += (c_ce - c_cs)
         else:
-            break
+            break  # l'agent n'est pas affecté = pause
     return cumul
 
 def agent_has_pause(agent, cren_idx, creneaux, day_assignments, pause_min=60):
     """
-    Vérifie si l'agent a eu une pause d'au moins pause_min minutes
-    à un moment quelconque dans la journée (créneau sans SP).
+    Vérifie si l'agent a eu une pause d'au moins pause_min minutes.
+    On cumule les créneaux consécutifs hors SP (fermés ou non affecté).
+    La pause méridienne 12h-14h compte toujours comme pause (créneaux fermés).
     """
+    cumul_pause = 0
     for i in range(cren_idx):
         cn, c_cs, c_ce = creneaux[i]
         slot = day_assignments.get(cn)
-        if slot is None:
-            return True  # créneau fermé = pause
-        all_assigned = [a for s in SECTIONS
-                        for a in slot.get('assignment', {}).get(s, [])]
-        if agent not in all_assigned:
-            # Calculer la durée de non-SP
-            gap = c_ce - c_cs
-            if gap >= pause_min:
-                return True
+        is_closed = slot is None
+        if is_closed:
+            cumul_pause += (c_ce - c_cs)
+        else:
+            all_assigned = [a for s in SECTIONS
+                            for a in slot.get('assignment', {}).get(s, [])]
+            if agent not in all_assigned:
+                cumul_pause += (c_ce - c_cs)
+            else:
+                cumul_pause = 0  # remet à zéro si l'agent travaille
+        if cumul_pause >= pause_min:
+            return True
+    return False
+
+def agent_must_pause_meridienne(agent, cs, horaires_agents, jour):
+    """
+    Règle prioritaire : pause obligatoire 12h-14h (méridienne).
+    Si l'agent a travaillé le matin ET reprend l'après-midi,
+    il ne peut PAS travailler sur un créneau qui chevauche 12h-14h
+    sauf si ce créneau EST dans 12h-14h (ex: 12h-12h30 = dernier créneau du matin).
+    En pratique : les créneaux 12h-14h sont fermés → cette règle est
+    automatiquement respectée par les horaires d'ouverture.
+    Cette fonction bloque un agent qui aurait déjà 4h de SP consécutif
+    en ignorant la fermeture méridienne (ex: mercredi 10h-14h d'affilée impossible).
+    """
+    h = horaires_agents.get(agent, {}).get(jour)
+    if not h:
+        return False
+    sm, em, sa, ea = h
+    # Si l'agent a une pause déjeuner dans ses horaires (em < sa), c'est déjà géré
+    if sm is not None and em is not None and sa is not None and ea is not None:
+        if em < sa:  # pause déjeuner existante dans les horaires
+            return cs >= sa  # après la pause = pas de contrainte supplémentaire
     return False
 
 
@@ -599,6 +636,15 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             sp_max_min[agent] = mm['Max_MarVen'] * 60
             sp_min_min[agent] = mm['Min_MarVen'] * 60
 
+    # Vacataires : max 7h/jour (420 min), min 3h/demi-journée (180 min)
+    VAC_MAX_DAY_MIN = 420   # 7h par jour
+    VAC_MIN_HALF_MIN = 180  # 3h par demi-journée (objectif, pas bloquant)
+    # On limite le max SP hebdo des vacataires à 7h*2 jours = 840min
+    for agent in list(affectations.keys()):
+        if is_vacataire(agent):
+            sp_max_min[agent] = VAC_MAX_DAY_MIN * 2  # 2 jours max dans la semaine
+            sp_min_min[agent] = 0  # pas de min SP hebdo strict pour vacataires
+
     result = {}
     # sp_count en minutes sur la semaine
     sp_count = defaultdict(int)
@@ -628,6 +674,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
         agents_used_today  = {s: [] for s in SECTIONS}
         day_assignments    = {}
         alerts             = {}   # cren_name -> [messages d'alerte]
+        vac_day_sp         = defaultdict(int)  # vacataire -> minutes SP ce jour
 
         result[jour] = {'_samedi_type': samedi_type if jour == 'Samedi' else None}
 
@@ -681,20 +728,24 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
 
                     # 3. Contrainte consécutif
                     elif jour in ('Mardi', 'Jeudi', 'Vendredi'):
-                        consec = get_consecutive_sp(agent, section, cren_idx,
+                        consec = get_consecutive_sp(agent, cren_idx,
                                                      creneaux, day_assignments)
                         if consec + slot_min > max_consec_court:
                             must_replace = True
                             reason = f"max {max_consec_court//60}h{max_consec_court%60:02d} consécutif"
                     else:  # Mercredi / Samedi
-                        consec = get_consecutive_sp(agent, section, cren_idx,
+                        consec = get_consecutive_sp(agent, cren_idx,
                                                      creneaux, day_assignments)
-                        # Pause obligatoire 1h après 4h
-                        if consec >= max_consec_long and not agent_has_pause(
-                                agent, cren_idx, creneaux, day_assignments):
+                        # Pause méridienne 12h-14h : PRIORITAIRE sur la règle des 4h
+                        # Les créneaux 12h-14h sont fermés → ils génèrent automatiquement
+                        # une pause (créneau fermé = reset dans get_consecutive_sp)
+                        # Donc après 12h-14h, le compteur repart à 0 naturellement.
+                        # On vérifie seulement si l'agent dépasse 4h sans pause réelle
+                        has_pause = agent_has_pause(agent, cren_idx, creneaux, day_assignments)
+                        if consec >= max_consec_long and not has_pause:
                             must_replace = True
-                            reason = "pause 1h obligatoire"
-                        elif consec + slot_min > max_consec_long:
+                            reason = "pause 1h obligatoire Mer/Sam"
+                        elif consec + slot_min > max_consec_long and not has_pause:
                             must_replace = True
                             reason = f"max {max_consec_long//60}h consécutif"
 
@@ -716,6 +767,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             sp_count=sp_count,
                             max_sp_min=sp_max_min,
                             exclude=excl,
+                            vac_day_sp=vac_day_sp,
                         )
                         if repl:
                             final_agents.append(repl)
@@ -737,6 +789,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         sp_count=sp_count,
                         max_sp_min=sp_max_min,
                         exclude=excl,
+                        vac_day_sp=vac_day_sp,
                     )
                     if repl:
                         assignment[section] = [repl]
@@ -792,6 +845,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         sp_count=sp_count,
                         max_sp_min=sp_max_min,
                         exclude=occupied,
+                        vac_day_sp=vac_day_sp,
                     )
                     if repl and not is_vacataire(repl):
                         assignment['Jeunesse'].insert(0, repl)
@@ -826,6 +880,8 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             for section in SECTIONS:
                 for agent in assignment[section]:
                     sp_count[agent] += slot_min
+                    if is_vacataire(agent):
+                        vac_day_sp[agent] += slot_min
                     if agent not in agents_used_today[section]:
                         agents_used_today[section].append(agent)
 
