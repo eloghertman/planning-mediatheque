@@ -1,11 +1,16 @@
 """
-Planning Engine — Médiathèque
-Calcule automatiquement le planning SP à partir des variables Excel
+Planning Engine v3 — Médiathèque
+Logique : planning type comme base → ajustements uniquement là où les contraintes l'imposent
+Règles :
+  - Blocs de 2h ou 2h30 privilégiés (pas de changement toutes les heures)
+  - Max 3 agents différents/section/jour (Mar/Jeu/Ven) — max 4 (Mer/Sam)
+  - Pas de vacataire seul en Jeunesse sur 10h-12h et 14h-19h (exception 12h-14h)
+  - Pas de vacataire seul (toutes sections) plus de 2h consécutives
+  - Partir du planning type, modifier seulement les créneaux impactés
 """
 
 import pandas as pd
 from datetime import datetime, timedelta
-import calendar
 from collections import defaultdict
 
 
@@ -14,20 +19,21 @@ from collections import defaultdict
 # ─────────────────────────────────────────────
 
 def hm_to_min(val):
-    """Convertit un objet time, timedelta, string 'HH:MM' ou 'HH:MM:SS' en minutes."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
-    if hasattr(val, 'hour'):          # datetime.time
+    if hasattr(val, 'hour'):
         return val.hour * 60 + val.minute
-    if isinstance(val, timedelta):    # timedelta (Excel stocke parfois comme ça)
-        total = int(val.total_seconds())
-        return total // 60
+    if isinstance(val, timedelta):
+        return int(val.total_seconds()) // 60
     if isinstance(val, str):
         val = val.strip()
-        if not val:
+        if not val or val == 'nan':
             return None
-        parts = val.split(':')
-        return int(parts[0]) * 60 + int(parts[1])
+        parts = val.replace('H', ':').replace('h', ':').split(':')
+        try:
+            return int(parts[0]) * 60 + (int(parts[1]) if len(parts) >= 2 else 0)
+        except:
+            return None
     return None
 
 def min_to_hhmm(minutes):
@@ -36,8 +42,10 @@ def min_to_hhmm(minutes):
     return f"{minutes//60:02d}:{minutes%60:02d}"
 
 def overlap(s1, e1, s2, e2):
-    """True si les deux intervalles se chevauchent."""
     return s1 < e2 and e1 > s2
+
+def is_vacataire(agent):
+    return 'vacataire' in str(agent).lower()
 
 
 # ─────────────────────────────────────────────
@@ -62,7 +70,6 @@ def parse_parametres(data):
     return params
 
 def parse_horaires_ouverture(data):
-    """Retourne dict: jour -> [(start_min, end_min), ...]"""
     df = data['Horaire_ouverture_mediatheque']
     result = {}
     for _, row in df.iterrows():
@@ -70,8 +77,8 @@ def parse_horaires_ouverture(data):
         if not jour or jour in ('Jour', 'nan'):
             continue
         slots = []
-        for i in range(2, len(row)-1, 2):
-            s = hm_to_min(row.iloc[i]) if pd.notna(row.iloc[i]) else None
+        for i in range(2, len(row) - 1, 2):
+            s = hm_to_min(row.iloc[i])   if pd.notna(row.iloc[i])   else None
             e = hm_to_min(row.iloc[i+1]) if pd.notna(row.iloc[i+1]) else None
             if s is not None and e is not None and s != e:
                 slots.append((s, e))
@@ -80,7 +87,6 @@ def parse_horaires_ouverture(data):
     return result
 
 def parse_affectations(data):
-    """Retourne dict: agent -> [section1, section2, ...]"""
     df = data['Affectations']
     result = {}
     for _, row in df.iterrows():
@@ -93,7 +99,6 @@ def parse_affectations(data):
     return result
 
 def parse_horaires_agents(data):
-    """Retourne dict: agent -> jour -> (start_matin, end_matin, start_apm, end_apm)"""
     df = data['Horaires_Des_Agents']
     result = defaultdict(dict)
     for _, row in df.iterrows():
@@ -109,10 +114,9 @@ def parse_horaires_agents(data):
     return dict(result)
 
 def parse_besoins_jeunesse(data):
-    """Retourne dict: creneau -> {'Mardi': n, 'Mercredi': n, ..., 'Samedi_rouge': n, 'samedi bleu': n}"""
     df = data['Besoins_Jeunesse']
     result = {}
-    cols = [str(c).strip() for c in df.iloc[0]]  # header row
+    cols = [str(c).strip() for c in df.iloc[0]]
     for _, row in df.iterrows():
         cren = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else None
         if not cren or cren == 'Créneau':
@@ -125,7 +129,6 @@ def parse_besoins_jeunesse(data):
     return result
 
 def parse_sp_minmax(data):
-    """Retourne dict: agent -> {Min_MarVen, Max_MarVen, Min_MarSam, Max_MarSam, SP_Samedi_Type}"""
     df = data['SP_MinMax']
     result = {}
     for _, row in df.iterrows():
@@ -133,16 +136,15 @@ def parse_sp_minmax(data):
         if not agent or agent == 'Agent':
             continue
         result[agent] = {
-            'Min_MarVen':      row.iloc[1] if pd.notna(row.iloc[1]) else 0,
-            'Max_MarVen':      row.iloc[2] if pd.notna(row.iloc[2]) else 99,
-            'Min_MarSam':      row.iloc[3] if pd.notna(row.iloc[3]) else 0,
-            'Max_MarSam':      row.iloc[4] if pd.notna(row.iloc[4]) else 99,
-            'SP_Samedi_Type':  row.iloc[5] if pd.notna(row.iloc[5]) else 0,
+            'Min_MarVen':     float(row.iloc[1]) if pd.notna(row.iloc[1]) else 0,
+            'Max_MarVen':     float(row.iloc[2]) if pd.notna(row.iloc[2]) else 99,
+            'Min_MarSam':     float(row.iloc[3]) if pd.notna(row.iloc[3]) else 0,
+            'Max_MarSam':     float(row.iloc[4]) if pd.notna(row.iloc[4]) else 99,
+            'SP_Samedi_Type': float(row.iloc[5]) if pd.notna(row.iloc[5]) else 0,
         }
     return result
 
 def parse_roulement_samedi(data):
-    """Retourne dict: agent -> 'BLEU' | 'ROUGE'"""
     df = data['Roulement_Samedi']
     result = {}
     for _, row in df.iterrows():
@@ -155,43 +157,26 @@ def parse_roulement_samedi(data):
     return result
 
 def parse_evenements(data, mois, annee):
-    """
-    Retourne dict: date_str ('2026-01-27') -> list of
-      {'debut': min, 'fin': min, 'nom': str, 'agents': [str]}
-    """
     df = data['Événements']
     result = defaultdict(list)
-    agent_cols = [i for i, c in enumerate(df.iloc[0]) if str(c).strip().lower() in ('agents','agent','agents evenemtns','agents evenements') or (i >= 4 and i <= 9)]
-
     for _, row in df.iterrows():
         date_val = row.iloc[0]
         if not pd.notna(date_val):
             continue
         try:
-            if isinstance(date_val, (datetime,)):
-                d = date_val
-            else:
-                d = pd.to_datetime(date_val)
+            d = date_val if isinstance(date_val, datetime) else pd.to_datetime(date_val)
             if d.month != mois or d.year != annee:
                 continue
         except:
             continue
-
         debut = hm_to_min(row.iloc[1]) if pd.notna(row.iloc[1]) else None
         fin   = hm_to_min(row.iloc[2]) if pd.notna(row.iloc[2]) else None
         nom   = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else None
-
         if not nom or nom == 'nan' or debut is None:
             continue
-
-        agents = []
-        for i in range(4, min(11, len(row))):
-            v = row.iloc[i]
-            if pd.notna(v) and str(v).strip() not in ('nan', ''):
-                agents.append(str(v).strip())
-
-        date_str = d.strftime('%Y-%m-%d')
-        result[date_str].append({
+        agents = [str(row.iloc[i]).strip() for i in range(4, min(11, len(row)))
+                  if pd.notna(row.iloc[i]) and str(row.iloc[i]).strip() not in ('nan', '')]
+        result[d.strftime('%Y-%m-%d')].append({
             'debut': debut,
             'fin':   fin if fin else debut + 60,
             'nom':   nom,
@@ -200,7 +185,6 @@ def parse_evenements(data, mois, annee):
     return dict(result)
 
 def parse_creneaux(params):
-    """Parse la liste des créneaux depuis les paramètres."""
     raw = params.get('Liste_des_créneaux', '')
     if not raw:
         return []
@@ -217,110 +201,138 @@ def parse_creneaux(params):
 
 
 # ─────────────────────────────────────────────
-#  CALCUL DES SEMAINES DU MOIS
+#  PARSING DU PLANNING TYPE
 # ─────────────────────────────────────────────
 
-JOURS_FR = ['Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi','Dimanche']
-JOURS_SP = ['Mardi','Mercredi','Jeudi','Vendredi','Samedi']
-
-def get_weeks_of_month(mois, annee):
+def parse_planning_type(data):
     """
-    Retourne une liste de semaines, chaque semaine = dict:
-      { 'Mardi': date, 'Mercredi': date, 'Jeudi': date, 'Vendredi': date, 'Samedi': date }
+    Lit l'onglet planning_type.
+    Retourne { 'Mardi'|'Mercredi'|...|'Samedi_ROUGE'|'Samedi_BLEU' ->
+               [ (bloc_label, {section: [agents]}) ] }
     """
-    # Premier jour du mois
-    first_day = datetime(annee, mois, 1)
-    # Trouver le premier mardi
-    weekday = first_day.weekday()  # 0=lundi, 1=mardi
-    days_to_tuesday = (1 - weekday) % 7
-    first_tuesday = first_day + timedelta(days=days_to_tuesday)
+    df = data['planning_type']
 
-    weeks = []
-    current = first_tuesday
-    while current.month == mois:
-        week = {}
-        for i, jour in enumerate(JOURS_SP):
-            # Mardi=0, Mercredi=1, Jeudi=2, Vendredi=3, Samedi=4
-            offsets = {'Mardi':0,'Mercredi':1,'Jeudi':2,'Vendredi':3,'Samedi':4}
-            d = current + timedelta(days=offsets[jour])
-            if d.month == mois:
-                week[jour] = d
-        if week:
-            weeks.append(week)
-        current += timedelta(weeks=1)
-    return weeks
+    SECTION_COLS = {
+        'RDC':      [2],
+        'Adulte':   [3],
+        'MF':       [5, 6],
+        'Jeunesse': [7, 8, 9],
+    }
+    JOUR_MAP = {
+        'MARDI': 'Mardi', 'MERCREDI': 'Mercredi', 'JEUDI': 'Jeudi',
+        'VENDREDI': 'Vendredi',
+    }
+
+    raw_blocs    = {}
+    current_jour = None
+    samedi_count = 0
+
+    for _, row in df.iterrows():
+        cell0 = str(row.iloc[0]).strip().upper() if pd.notna(row.iloc[0]) else ''
+        cell1 = str(row.iloc[1]).strip()          if pd.notna(row.iloc[1]) else ''
+
+        if cell0 in JOUR_MAP:
+            current_jour = JOUR_MAP[cell0]
+            raw_blocs[current_jour] = []
+            continue
+
+        if cell0 == 'SAMEDI':
+            samedi_count += 1
+            current_jour = 'Samedi_ROUGE' if samedi_count == 1 else 'Samedi_BLEU'
+            raw_blocs[current_jour] = []
+            continue
+
+        if not current_jour:
+            continue
+
+        skip_cells = {'nan', '', 'R D C', 'Adulte', 'Musique & Films',
+                      'Jeunesse', '12H30', '15H30'}
+        if not cell1 or cell1 in skip_cells:
+            continue
+
+        bloc = {s: [] for s in ['RDC', 'Adulte', 'MF', 'Jeunesse']}
+        for section, col_indices in SECTION_COLS.items():
+            for ci in col_indices:
+                if ci < len(row):
+                    v = str(row.iloc[ci]).strip() if pd.notna(row.iloc[ci]) else ''
+                    if v and v not in ('nan', '', '-', 'NaN'):
+                        agent = v.split(' à ')[0].split(' à partir')[0].strip()
+                        if agent:
+                            bloc[section].append(agent)
+
+        raw_blocs[current_jour].append((cell1, bloc))
+
+    return raw_blocs
+
+
+def explode_planning_type_to_creneaux(raw_blocs, creneaux_def):
+    """
+    Convertit les blocs du planning type (ex: "10H-12H30")
+    en créneaux unitaires (ex: "10:00-11:00", "11:00-12:00", "12:00-12:30").
+    Retourne { jour_key -> { cren_name -> { section -> [agents] } } }
+    """
+    def parse_bloc_time(label):
+        label = label.strip().upper()
+        label = label.replace('H', ':')
+        if '-' not in label:
+            return None, None
+        parts = label.split('-')
+        def fix(p):
+            p = p.strip().rstrip(':')
+            if ':' not in p:
+                p += ':00'
+            return p
+        s = hm_to_min(fix(parts[0]))
+        e = hm_to_min(fix(parts[1]))
+        return s, e
+
+    result = {}
+    for jour_key, blocs in raw_blocs.items():
+        result[jour_key] = {}
+        for cren_label, bloc_assignment in blocs:
+            bs, be = parse_bloc_time(cren_label)
+            if bs is None or be is None:
+                continue
+            for cren_name, cs, ce in creneaux_def:
+                if cs >= bs and ce <= be:
+                    result[jour_key][cren_name] = {
+                        s: list(agents) for s, agents in bloc_assignment.items()
+                    }
+    return result
 
 
 # ─────────────────────────────────────────────
-#  MOTEUR DE PLANIFICATION
+#  DISPONIBILITÉ
 # ─────────────────────────────────────────────
 
-SECTIONS = ['RDC', 'Adulte', 'MF', 'Jeunesse']
-
-def is_vacataire(agent):
-    return 'vacataire' in agent.lower()
-
-def agent_working(agent, jour, horaires_agents):
-    """Retourne (sm, em, sa, ea) ou None si l'agent ne travaille pas ce jour."""
-    return horaires_agents.get(agent, {}).get(jour)
-
-def agent_blocked_by_event(agent, cs, ce, date_str, evenements):
-    """True si l'agent est bloqué par un événement sur ce créneau."""
-    evts = evenements.get(date_str, [])
-    for ev in evts:
-        if agent in ev['agents']:
-            if overlap(cs, ce, ev['debut'], ev['fin']):
-                return True, ev['nom']
-    return False, None
+JOURS_SP = ['Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi']
+SECTIONS  = ['RDC', 'Adulte', 'MF', 'Jeunesse']
+MOIS_MAP  = {
+    'janvier':1,'février':2,'mars':3,'avril':4,'mai':5,'juin':6,
+    'juillet':7,'août':8,'septembre':9,'octobre':10,'novembre':11,'décembre':12
+}
 
 def agent_available_for_sp(agent, jour, cs, ce, date_str, horaires_agents, evenements):
-    """Vérifie si l'agent peut faire du SP sur ce créneau."""
-    h = agent_working(agent, jour, horaires_agents)
+    h = horaires_agents.get(agent, {}).get(jour)
     if h is None:
         return False
     sm, em, sa, ea = h
-    in_matin = sm is not None and em is not None and cs >= sm and ce <= em
-    in_apm   = sa is not None and ea is not None and cs >= sa and ce <= ea
-    if not (in_matin or in_apm):
+    in_m = sm is not None and em is not None and cs >= sm and ce <= em
+    in_a = sa is not None and ea is not None and cs >= sa and ce <= ea
+    if not (in_m or in_a):
         return False
-    blocked, _ = agent_blocked_by_event(agent, cs, ce, date_str, evenements)
-    return not blocked
+    for ev in evenements.get(date_str, []):
+        if agent in ev['agents'] and overlap(cs, ce, ev['debut'], ev['fin']):
+            return False
+    return True
 
 def creneau_is_open(cs, ce, jour, horaires_ouverture):
-    for (os, oe) in horaires_ouverture.get(jour, []):
+    for os, oe in horaires_ouverture.get(jour, []):
         if cs >= os and ce <= oe:
             return True
     return False
 
-def get_samedi_type(week_dates, roulement_samedi):
-    """
-    Détermine si le samedi de cette semaine est ROUGE ou BLEU.
-    On compte le nombre de samedis depuis le début de l'année et on alterne.
-    Convention : semaine 1 = ROUGE si le premier samedi du mois est ROUGE pour les agents ROUGE.
-    On regarde juste la parité de la semaine dans le mois.
-    """
-    # On retourne ROUGE pour les semaines impaires, BLEU pour les paires
-    # (par défaut — l'utilisateur peut overrider dans les paramètres)
-    return 'ROUGE'  # sera calculé dynamiquement par numéro de semaine
-
-def compute_samedi_type_by_week(week_num):
-    """Semaine 1 et 3 = ROUGE, semaine 2 et 4 = BLEU (convention standard)."""
-    return 'ROUGE' if week_num % 2 == 1 else 'BLEU'
-
-def get_agents_for_samedi(roulement_samedi, samedi_type, affectations):
-    """Retourne les agents qui travaillent ce samedi (selon ROUGE/BLEU)."""
-    agents = []
-    for agent, roul in roulement_samedi.items():
-        if roul == samedi_type:
-            agents.append(agent)
-    # Ajouter les vacataires (ils travaillent tous les samedis)
-    for agent in affectations:
-        if is_vacataire(agent) and agent not in agents:
-            agents.append(agent)
-    return agents
-
 def exception_vacataire_seul(cs, ce, params):
-    """True si ce créneau est dans la fenêtre d'exception vacataire seul (ex: 12h-14h)."""
     exc = params.get('Exception_Vacataire_seul', '12:00-14:00')
     if not exc or str(exc) == 'nan':
         return False
@@ -332,48 +344,161 @@ def exception_vacataire_seul(cs, ce, params):
             return cs >= es and ce <= ee
     return False
 
-def has_regular_agent(agents_assigned, affectations):
-    """Vérifie qu'il y a au moins un agent régulier (non vacataire) parmi les assignés."""
-    for a in agents_assigned:
-        if not is_vacataire(a):
-            return True
-    return False
 
-def compute_jeunesse_needs(cren_name, jour, samedi_type, besoins_jeunesse):
-    """Retourne le nombre d'agents Jeunesse nécessaires pour ce créneau."""
-    bj = besoins_jeunesse.get(cren_name, {})
-    if jour == 'Samedi':
-        key = 'Samedi_rouge' if samedi_type == 'ROUGE' else 'samedi bleu'
-        return bj.get(key, bj.get('Samedi_rouge', 1))
-    return bj.get(jour, 1)
+# ─────────────────────────────────────────────
+#  SEMAINES ET SAMEDIS
+# ─────────────────────────────────────────────
 
-def minutes_of_cren(cs, ce):
-    return ce - cs
+def get_weeks_of_month(mois, annee):
+    first_day = datetime(annee, mois, 1)
+    days_to_tuesday = (1 - first_day.weekday()) % 7
+    first_tuesday = first_day + timedelta(days=days_to_tuesday)
+    weeks = []
+    current = first_tuesday
+    offsets = {'Mardi': 0, 'Mercredi': 1, 'Jeudi': 2, 'Vendredi': 3, 'Samedi': 4}
+    while current.month == mois:
+        week = {j: current + timedelta(days=o) for j, o in offsets.items()
+                if (current + timedelta(days=o)).month == mois}
+        if week:
+            weeks.append(week)
+        current += timedelta(weeks=1)
+    return weeks
+
+def compute_samedi_type(week_num):
+    return 'ROUGE' if week_num % 2 == 1 else 'BLEU'
+
+def get_agents_for_samedi(roulement_samedi, samedi_type, affectations, horaires_agents):
+    agents = [a for a, r in roulement_samedi.items()
+              if r == samedi_type and horaires_agents.get(a, {}).get('Samedi') is not None]
+    for agent in affectations:
+        if is_vacataire(agent) and agent not in agents \
+           and horaires_agents.get(agent, {}).get('Samedi') is not None:
+            agents.append(agent)
+    return agents
 
 
 # ─────────────────────────────────────────────
-#  ALGORITHME PRINCIPAL DE PLANIFICATION
+#  REMPLACEMENT D'AGENT
 # ─────────────────────────────────────────────
 
-def plan_week(
-    week_num, week_dates,
-    affectations, horaires_agents, horaires_ouverture,
-    besoins_jeunesse, sp_minmax, roulement_samedi,
-    evenements, params, creneaux
-):
+def find_replacement(section, jour, cs, ce, date_str,
+                     eligible, affectations, horaires_agents, evenements,
+                     agents_used_today_section, exclude=None):
     """
-    Calcule le planning d'une semaine.
-    Retourne dict: jour -> creneau_name -> { section -> [agents], 'events': [...] }
+    Cherche le meilleur remplaçant disponible pour une section/créneau.
+    Priorité :
+      1. Agent déjà utilisé dans cette section aujourd'hui (continuité de bloc)
+      2. Agent régulier (non vacataire)
+      3. Agent avec le moins de créneaux utilisés aujourd'hui
     """
-    samedi_type = compute_samedi_type_by_week(week_num)
-    samedi_agents = get_agents_for_samedi(roulement_samedi, samedi_type, affectations)
+    exclude = exclude or set()
+    candidates = []
+    for agent in eligible:
+        if agent in exclude:
+            continue
+        if section not in affectations.get(agent, []):
+            continue
+        if not agent_available_for_sp(agent, jour, cs, ce, date_str,
+                                       horaires_agents, evenements):
+            continue
+        already_today = agent in agents_used_today_section
+        candidates.append((
+            not already_today,   # priorité aux agents déjà utilisés
+            is_vacataire(agent), # réguliers avant vacataires
+            agent
+        ))
 
-    all_agents = list(affectations.keys())
-    vacataires = [a for a in all_agents if is_vacataire(a)]
-    regular_agents = [a for a in all_agents if not is_vacataire(a)]
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][2]
 
-    # Compteur SP par agent (en minutes)
-    sp_count = defaultdict(int)
+
+# ─────────────────────────────────────────────
+#  CONTRAINTES VACATAIRE
+# ─────────────────────────────────────────────
+
+def check_vacataire_constraints(assignment, section, jour, cs, ce, date_str,
+                                 creneaux, day_assignments,
+                                 eligible, affectations, horaires_agents,
+                                 evenements, params):
+    """
+    Pour une section donnée, vérifie et corrige si nécessaire :
+    1. Jeunesse : pas de vacataire seul hors fenêtre exception (10h-12h, 14h-19h)
+    2. Toutes sections : pas de vacataire seul plus de 2h consécutives
+    Retourne la liste d'agents corrigée.
+    """
+    agents = assignment.get(section, [])
+    if not agents or not all(is_vacataire(a) for a in agents):
+        return agents  # au moins un régulier, pas de problème
+
+    is_exc = exception_vacataire_seul(cs, ce, params)
+    MAX_VAC_ALONE_MIN = 120
+
+    need_regular = False
+
+    # Règle 1 : Jeunesse hors exception
+    if section == 'Jeunesse' and not is_exc:
+        need_regular = True
+
+    # Règle 2 : 2h consécutives vacataire seul (toutes sections)
+    if not need_regular:
+        cumul = 0
+        for cn, c_cs, c_ce in creneaux:
+            if c_cs == cs and c_ce == ce:
+                break
+            prev = day_assignments.get(cn)
+            if prev is None:
+                cumul = 0
+                continue
+            prev_agents = prev.get(section, [])
+            if prev_agents and all(is_vacataire(a) for a in prev_agents):
+                cumul += (c_ce - c_cs)
+            else:
+                cumul = 0
+        if cumul >= MAX_VAC_ALONE_MIN:
+            need_regular = True
+
+    if not need_regular:
+        return agents
+
+    # Chercher un régulier disponible
+    used_today = [a for cn, _, _ in creneaux
+                  for a in day_assignments.get(cn, {}).get(section, [])
+                  if not is_vacataire(a)]
+    exclude = set(a for s in SECTIONS for a in assignment.get(s, [])
+                  if a not in agents)
+
+    repl = find_replacement(
+        section=section, jour=jour, cs=cs, ce=ce, date_str=date_str,
+        eligible=eligible, affectations=affectations,
+        horaires_agents=horaires_agents, evenements=evenements,
+        agents_used_today_section=used_today,
+        exclude=exclude,
+    )
+    if repl:
+        return [repl] + agents
+    return agents
+
+
+# ─────────────────────────────────────────────
+#  ALGORITHME PRINCIPAL
+# ─────────────────────────────────────────────
+
+def plan_week(week_num, week_dates, planning_type_base,
+              affectations, horaires_agents, horaires_ouverture,
+              besoins_jeunesse, sp_minmax, roulement_samedi,
+              evenements, params, creneaux):
+
+    samedi_type   = compute_samedi_type(week_num)
+    samedi_agents = get_agents_for_samedi(roulement_samedi, samedi_type,
+                                          affectations, horaires_agents)
+    all_agents    = list(affectations.keys())
+    vac_days      = str(params.get('Mode_vacataires', 'mercredi,samedi')).lower()
+
+    MAX_AGENTS_PER_SECTION = {
+        'Mardi': 3, 'Mercredi': 4, 'Jeudi': 3, 'Vendredi': 3, 'Samedi': 4
+    }
 
     result = {}
 
@@ -383,178 +508,216 @@ def plan_week(
             continue
         date_str = date.strftime('%Y-%m-%d')
 
-        # Agents disponibles ce jour
+        # Agents éligibles ce jour
         if jour == 'Samedi':
             eligible = samedi_agents
+        elif jour.lower() in vac_days:
+            eligible = [a for a in all_agents
+                       if horaires_agents.get(a, {}).get(jour) is not None]
         else:
-            eligible = regular_agents  # pas de vacataires Mardi-Vendredi
+            eligible = [a for a in all_agents if not is_vacataire(a)
+                       and horaires_agents.get(a, {}).get(jour) is not None]
 
-        # Vacataires uniquement mercredi et samedi
-        vac_days = str(params.get('Mode_vacataires', 'mercredi,samedi')).lower()
-        if jour.lower() in vac_days:
-            eligible = all_agents
-        else:
-            eligible = regular_agents
+        # Clé du planning type
+        pt_key = f"Samedi_{samedi_type}" if jour == 'Samedi' else jour
+        base   = planning_type_base.get(pt_key, {})
+        max_rot = MAX_AGENTS_PER_SECTION.get(jour, 4)
+
+        # Suivi des agents utilisés par section aujourd'hui (pour limiter la rotation)
+        agents_used_today = {s: [] for s in SECTIONS}
+        day_assignments   = {}
 
         result[jour] = {'_samedi_type': samedi_type if jour == 'Samedi' else None}
 
         for cren_name, cs, ce in creneaux:
-            # Vérifier si ouvert
             if not creneau_is_open(cs, ce, jour, horaires_ouverture):
-                result[jour][cren_name] = None  # fermé
+                result[jour][cren_name] = None
                 continue
 
-            # Récupérer les événements du créneau
-            slot_events = []
-            for ev in evenements.get(date_str, []):
-                if overlap(cs, ce, ev['debut'], ev['fin']):
-                    slot_events.append(ev)
+            # Point de départ : planning type
+            base_slot  = base.get(cren_name, {s: [] for s in SECTIONS})
+            assignment = {s: list(base_slot.get(s, [])) for s in SECTIONS}
 
-            # Besoins Jeunesse
-            j_needs = compute_jeunesse_needs(cren_name, jour, samedi_type, besoins_jeunesse)
-
-            # Assignation par section
-            assignment = {s: [] for s in SECTIONS}
-
-            # Pour chaque section, trouver les agents disponibles
+            # Vérifier chaque agent, remplacer si bloqué
             for section in SECTIONS:
-                if section == 'Jeunesse':
-                    continue  # traité séparément
+                final_agents = []
+                for agent in assignment[section]:
+                    # Normaliser "VACATAIRES" générique
+                    if agent.upper() in ('VACATAIRES', 'VACATAIRE'):
+                        vac_avail = [a for a in eligible if is_vacataire(a)
+                                    and agent_available_for_sp(a, jour, cs, ce, date_str,
+                                                                horaires_agents, evenements)
+                                    and a not in final_agents]
+                        if vac_avail:
+                            final_agents.append(vac_avail[0])
+                        continue
 
-                # Agents qui peuvent couvrir cette section ce créneau
-                candidates = []
+                    if agent_available_for_sp(agent, jour, cs, ce, date_str,
+                                              horaires_agents, evenements):
+                        final_agents.append(agent)
+                    else:
+                        # Chercher remplaçant — privilégier continuité de bloc
+                        already_in = agents_used_today[section]
+                        excl = set(final_agents) | set(
+                            a for s2 in SECTIONS for a in assignment.get(s2, [])
+                            if s2 != section)
+                        repl = find_replacement(
+                            section=section, jour=jour, cs=cs, ce=ce,
+                            date_str=date_str, eligible=eligible,
+                            affectations=affectations,
+                            horaires_agents=horaires_agents,
+                            evenements=evenements,
+                            agents_used_today_section=already_in,
+                            exclude=excl,
+                        )
+                        if repl:
+                            final_agents.append(repl)
+
+                # Respecter la limite de rotation (max N agents différents/section/jour)
+                adjusted = []
+                for agent in final_agents:
+                    unique_reg = [a for a in agents_used_today[section]
+                                 if not is_vacataire(a)]
+                    if not is_vacataire(agent) and agent not in agents_used_today[section] \
+                       and len(unique_reg) >= max_rot:
+                        # Limite atteinte → réutiliser le dernier agent régulier dispo
+                        last = next(
+                            (a for a in reversed(agents_used_today[section])
+                             if not is_vacataire(a)
+                             and agent_available_for_sp(a, jour, cs, ce, date_str,
+                                                         horaires_agents, evenements)),
+                            None
+                        )
+                        if last and last not in adjusted:
+                            adjusted.append(last)
+                        else:
+                            adjusted.append(agent)  # on garde quand même si pas d'autre choix
+                    else:
+                        adjusted.append(agent)
+
+                assignment[section] = adjusted
+
+                # Mémoriser agents utilisés
+                for a in adjusted:
+                    if a not in agents_used_today[section]:
+                        agents_used_today[section].append(a)
+
+            # Compléter Jeunesse selon besoins
+            bj = besoins_jeunesse.get(cren_name, {})
+            if jour == 'Samedi':
+                j_needs = int(bj.get(f'Samedi_{samedi_type.lower()}',
+                                      bj.get('Samedi_rouge', 1)))
+            else:
+                j_needs = int(bj.get(jour, 1))
+            j_needs = max(j_needs, 1)
+
+            if len(assignment['Jeunesse']) < j_needs:
+                occupied = set(a for s in SECTIONS for a in assignment[s])
                 for agent in eligible:
-                    if section not in affectations.get(agent, []):
+                    if len(assignment['Jeunesse']) >= j_needs:
+                        break
+                    if agent in occupied:
+                        continue
+                    if 'Jeunesse' not in affectations.get(agent, []):
                         continue
                     if not agent_available_for_sp(agent, jour, cs, ce, date_str,
                                                    horaires_agents, evenements):
                         continue
-                    # Ne pas mettre le même agent dans 2 sections
-                    already_assigned = any(agent in assignment[s] for s in SECTIONS)
-                    if already_assigned:
-                        continue
-                    candidates.append(agent)
+                    assignment['Jeunesse'].append(agent)
+                    if agent not in agents_used_today['Jeunesse']:
+                        agents_used_today['Jeunesse'].append(agent)
 
-                if candidates:
-                    # Prioriser : agent avec moins de SP d'abord, non vacataire en premier
-                    candidates.sort(key=lambda a: (is_vacataire(a), sp_count[a]))
-                    chosen = candidates[0]
-                    assignment[section].append(chosen)
-
-            # Section Jeunesse
-            j_candidates = []
-            for agent in eligible:
-                if 'Jeunesse' not in affectations.get(agent, []):
-                    continue
-                if not agent_available_for_sp(agent, jour, cs, ce, date_str,
-                                               horaires_agents, evenements):
-                    continue
-                already_assigned = any(agent in assignment[s] for s in ['RDC', 'Adulte', 'MF'])
-                if already_assigned:
-                    continue
-                j_candidates.append(agent)
-
-            j_candidates.sort(key=lambda a: (is_vacataire(a), sp_count[a]))
-
-            for agent in j_candidates[:max(j_needs, 1)]:
-                assignment['Jeunesse'].append(agent)
-
-            # Règle vacataire seul
-            is_exception = exception_vacataire_seul(cs, ce, params)
+            # Appliquer contraintes vacataire section par section
             for section in SECTIONS:
-                agents_in_section = assignment[section]
-                if not agents_in_section:
-                    continue
-                all_vac = all(is_vacataire(a) for a in agents_in_section)
-                if all_vac and not is_exception:
-                    # Chercher un agent régulier pour accompagner
-                    for agent in eligible:
-                        if is_vacataire(agent):
-                            continue
-                        if section not in affectations.get(agent, []):
-                            continue
-                        if not agent_available_for_sp(agent, jour, cs, ce, date_str,
-                                                       horaires_agents, evenements):
-                            continue
-                        already = any(agent in assignment[s] for s in SECTIONS)
-                        if not already:
-                            assignment[section].insert(0, agent)
-                            break
+                assignment[section] = check_vacataire_constraints(
+                    assignment, section, jour, cs, ce, date_str,
+                    creneaux, day_assignments,
+                    eligible, affectations, horaires_agents, evenements, params
+                )
 
-            # Mettre à jour le compteur SP
-            for section, agents in assignment.items():
-                for agent in agents:
-                    sp_count[agent] += minutes_of_cren(cs, ce)
+            # Événements du créneau
+            slot_events = [ev for ev in evenements.get(date_str, [])
+                          if overlap(cs, ce, ev['debut'], ev['fin'])]
 
+            day_assignments[cren_name] = assignment
             result[jour][cren_name] = {
                 'assignment': assignment,
-                'events': slot_events,
-                'open': True,
+                'events':     slot_events,
+                'open':       True,
             }
 
-    return result, samedi_type, sp_count
+    # Compteur SP
+    sp_count = defaultdict(int)
+    for jour, jour_plan in result.items():
+        for cren_name, cs, ce in creneaux:
+            slot = jour_plan.get(cren_name)
+            if not slot or not isinstance(slot, dict) or not slot.get('open'):
+                continue
+            mins = ce - cs
+            for agents in slot.get('assignment', {}).values():
+                for agent in agents:
+                    sp_count[agent] += mins
 
+    return result, samedi_type, dict(sp_count)
+
+
+# ─────────────────────────────────────────────
+#  POINT D'ENTRÉE
+# ─────────────────────────────────────────────
 
 def compute_full_planning(filepath):
-    """
-    Point d'entrée principal.
-    Lit le fichier Excel, calcule le planning pour chaque semaine du mois.
-    Retourne: weeks_data list, params, metadata
-    """
-    raw = load_excel_data(filepath)
-
-    params           = parse_parametres(raw)
-    horaires_ouv     = parse_horaires_ouverture(raw)
-    affectations     = parse_affectations(raw)
-    horaires_agents  = parse_horaires_agents(raw)
-    besoins_j        = parse_besoins_jeunesse(raw)
-    sp_minmax        = parse_sp_minmax(raw)
-    roulement        = parse_roulement_samedi(raw)
-    creneaux         = parse_creneaux(params)
+    raw             = load_excel_data(filepath)
+    params          = parse_parametres(raw)
+    horaires_ouv    = parse_horaires_ouverture(raw)
+    affectations    = parse_affectations(raw)
+    horaires_agents = parse_horaires_agents(raw)
+    besoins_j       = parse_besoins_jeunesse(raw)
+    sp_minmax       = parse_sp_minmax(raw)
+    roulement       = parse_roulement_samedi(raw)
+    creneaux        = parse_creneaux(params)
 
     mois_str  = str(params.get('Mois', 'janvier')).strip().lower()
     annee     = int(params.get('Année', 2026))
+    mois_num  = MOIS_MAP.get(mois_str, 1)
 
-    MOIS_MAP = {
-        'janvier':1,'février':2,'mars':3,'avril':4,'mai':5,'juin':6,
-        'juillet':7,'août':8,'septembre':9,'octobre':10,'novembre':11,'décembre':12
-    }
-    mois_num = MOIS_MAP.get(mois_str, 1)
+    evenements          = parse_evenements(raw, mois_num, annee)
+    raw_blocs           = parse_planning_type(raw)
+    planning_type_base  = explode_planning_type_to_creneaux(raw_blocs, creneaux)
 
-    evenements = parse_evenements(raw, mois_num, annee)
-    weeks      = get_weeks_of_month(mois_num, annee)
-
+    weeks   = get_weeks_of_month(mois_num, annee)
     results = []
+
     for i, week_dates in enumerate(weeks):
         week_plan, samedi_type, sp_count = plan_week(
-            week_num        = i + 1,
-            week_dates      = week_dates,
-            affectations    = affectations,
-            horaires_agents = horaires_agents,
+            week_num           = i + 1,
+            week_dates         = week_dates,
+            planning_type_base = planning_type_base,
+            affectations       = affectations,
+            horaires_agents    = horaires_agents,
             horaires_ouverture = horaires_ouv,
             besoins_jeunesse   = besoins_j,
-            sp_minmax       = sp_minmax,
+            sp_minmax          = sp_minmax,
             roulement_samedi   = roulement,
-            evenements      = evenements,
-            params          = params,
-            creneaux        = creneaux,
+            evenements         = evenements,
+            params             = params,
+            creneaux           = creneaux,
         )
         results.append({
             'week_num':    i + 1,
             'week_dates':  week_dates,
             'plan':        week_plan,
             'samedi_type': samedi_type,
-            'sp_count':    dict(sp_count),
+            'sp_count':    sp_count,
         })
 
     metadata = {
-        'mois':      mois_str,
-        'annee':     annee,
-        'params':    params,
+        'mois':         mois_str,
+        'annee':        annee,
+        'params':       params,
         'affectations': affectations,
-        'creneaux':  creneaux,
+        'creneaux':     creneaux,
         'horaires_ouv': horaires_ouv,
-        'roulement': roulement,
+        'roulement':    roulement,
     }
 
     return results, metadata
