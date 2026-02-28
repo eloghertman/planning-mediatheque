@@ -86,10 +86,13 @@ with st.sidebar:
     st.markdown("""
     **Chaque mois, en 4 étapes :**
 
-    **① Préparez votre Excel**
-    - Mettez à jour l'onglet `Événements`
-    - Modifiez `Paramètres` si besoin (mois, année)
+    **① Préparez votre Excel — chaque mois**
+    - Mettez à jour l'onglet `Événements` (congés, réunions, absences)
+    - Dans `Paramètres` : changez **Mois**, **Année**
+    - Dans `Paramètres` : mettez à jour **Samedi_S1 à Samedi_S5** (ROUGE ou BLEU pour chaque samedi du mois) ⚠️ indispensable
+    - Mettez à jour `SP_MinMax` si les quotas SP changent
     - Ajustez `Horaires_Des_Agents` si des horaires ont changé
+    - Vérifiez `Roulement_Samedi` si l'équipe évolue
 
     **② Uploadez le fichier**
     - Cliquez sur *Browse files*
