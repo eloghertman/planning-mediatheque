@@ -335,14 +335,25 @@ def parse_sp_minmax(data):
                 except ValueError:
                     pass
             continue
-        if not c1 or c1 in ('Agent', 'nan', '') or current_week is None:
+        SKIP_C1 = ('Agent', 'nan', '', 'Min_MarVen', 'Max_MarVen',
+                   'Min_MarSam', 'Max_MarSam', 'SP_Samedi_Type', 'Créneau')
+        if not c1 or c1 in SKIP_C1 or current_week is None:
             continue
+        # Vérifier que les valeurs numériques sont bien des nombres
         try:
+            v2 = row.iloc[2] if len(row) > 2 else None
+            v3 = row.iloc[3] if len(row) > 3 else None
+            v4 = row.iloc[4] if len(row) > 4 else None
+            v5 = row.iloc[5] if len(row) > 5 else None
+            # Skip si les valeurs sont des chaînes (ligne d'en-tête)
+            if any(isinstance(v, str) and not v.replace('.','').replace('-','').isdigit()
+                   for v in [v2, v3, v4, v5] if v is not None and pd.notna(v)):
+                continue
             result[current_week][c1] = {
-                'Min_MarVen':     float(row.iloc[2]) if pd.notna(row.iloc[2]) else 0,
-                'Max_MarVen':     float(row.iloc[3]) if pd.notna(row.iloc[3]) else 99,
-                'Min_MarSam':     float(row.iloc[4]) if pd.notna(row.iloc[4]) else 0,
-                'Max_MarSam':     float(row.iloc[5]) if pd.notna(row.iloc[5]) else 99,
+                'Min_MarVen': float(v2) if v2 is not None and pd.notna(v2) else 0,
+                'Max_MarVen': float(v3) if v3 is not None and pd.notna(v3) else 99,
+                'Min_MarSam': float(v4) if v4 is not None and pd.notna(v4) else 0,
+                'Max_MarSam': float(v5) if v5 is not None and pd.notna(v5) else 99,
             }
         except (IndexError, ValueError):
             pass
