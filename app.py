@@ -223,7 +223,7 @@ if uploaded_file is not None:
                 rows_ev = []
                 for date_str, ev_list in sorted(evts.items()):
                     for ev in ev_list:
-                        from planning_engine import min_to_hhmm
+                        def min_to_hhmm(m): return f"{int(m)//60}h{int(m)%60:02d}" if m else '0h00'
                         rows_ev.append({
                             'Date': date_str,
                             'Début': min_to_hhmm(ev['debut']),
@@ -262,55 +262,54 @@ if uploaded_file is not None:
                 try:
                     file_buf2 = io.BytesIO(file_bytes)
                     weeks_data, metadata = compute_full_planning(file_buf2)
-
                     file_buf3 = io.BytesIO(file_bytes)
                     output_buf = generate_excel(file_buf3, weeks_data, metadata)
-
-                    st.markdown("---")
-                    st.markdown("### ✅ Étape 4 — Téléchargement")
-
-                    st.markdown("""
-                    <div class="success-box">
-                    ✅ <b>Planning généré avec succès !</b><br>
-                    Les 4 semaines ont été calculées en respectant toutes les contraintes.
-                    Cliquez sur le bouton pour télécharger votre fichier Excel.
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    # Résumé par semaine
-                    for wd in weeks_data:
-                        wn   = wd['week_num']
-                        wdat = wd['week_dates']
-                        sam  = wd['samedi_type']
-                        dates = sorted([d for d in wdat.values() if d is not None])
-                        label = f"{dates[0].day} au {dates[-1].day}" if dates else "?"
-                        col_a, col_b, col_c = st.columns([1, 2, 1])
-                        with col_a:
-                            st.markdown(f"**Semaine {wn}**")
-                        with col_b:
-                            mois_cap = str(metadata['mois']).capitalize()
-                            st.markdown(f"{label} {mois_cap} {metadata['annee']}")
-                        with col_c:
-                            badge = "🔴 ROUGE" if sam == 'ROUGE' else "🔵 BLEU"
-                            st.markdown(f"Samedi : {badge}")
-
-                    st.markdown("<br>", unsafe_allow_html=True)
-
-                    mois_cap = str(metadata['mois']).capitalize()
-                    filename = f"Planning_{mois_cap}_{metadata['annee']}.xlsx"
-
-                    st.download_button(
-                        label=f"⬇️  Télécharger le planning — {mois_cap} {metadata['annee']}",
-                        data=output_buf.getvalue(),
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-
+                    st.session_state['planning_bytes']    = output_buf.getvalue()
+                    st.session_state['planning_weeks']    = weeks_data
+                    st.session_state['planning_metadata'] = metadata
                 except Exception as e:
                     st.error(f"❌ Erreur lors de la génération : {str(e)}")
                     with st.expander("Détails de l'erreur"):
                         import traceback
                         st.code(traceback.format_exc())
+
+        if 'planning_bytes' in st.session_state:
+            weeks_data = st.session_state['planning_weeks']
+            metadata   = st.session_state['planning_metadata']
+            st.markdown("---")
+            st.markdown("### ✅ Étape 4 — Téléchargement")
+            st.markdown("""
+                    <div class="success-box">
+                    ✅ <b>Planning généré avec succès !</b><br>
+                    Les semaines ont été calculées en respectant toutes les contraintes.
+                    Cliquez sur le bouton pour télécharger votre fichier Excel.
+                    </div>
+                    """, unsafe_allow_html=True)
+            for wd in weeks_data:
+                wn   = wd['week_num']
+                wdat = wd['week_dates']
+                sam  = wd['samedi_type']
+                dates = sorted([d for d in wdat.values() if d is not None])
+                label = f"{dates[0].day} au {dates[-1].day}" if dates else "?"
+                col_a, col_b, col_c = st.columns([1, 2, 1])
+                with col_a:
+                    st.markdown(f"**Semaine {wn}**")
+                with col_b:
+                    mois_cap = str(metadata['mois']).capitalize()
+                    st.markdown(f"{label} {mois_cap} {metadata['annee']}")
+                with col_c:
+                    badge = "🔴 ROUGE" if sam == 'ROUGE' else "🔵 BLEU"
+                    st.markdown(f"Samedi : {badge}")
+            st.markdown("<br>", unsafe_allow_html=True)
+            mois_cap = str(metadata['mois']).capitalize()
+            filename = f"Planning_{mois_cap}_{metadata['annee']}.xlsx"
+            st.download_button(
+                label=f"⬇️  Télécharger le planning — {mois_cap} {metadata['annee']}",
+                data=st.session_state['planning_bytes'],
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
 
     except Exception as e:
         st.error(f"❌ Impossible de lire le fichier : {str(e)}")
