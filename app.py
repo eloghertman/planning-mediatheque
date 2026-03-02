@@ -112,7 +112,7 @@ with st.sidebar:
     - ✅ Événements / congés pris en compte
     - ✅ Besoins Jeunesse par créneau
     - ✅ Roulement samedi Rouge/Bleu
-    - ✅ Pas de vacataire seul (sauf 12h-14h)
+    - ✅ Pas de vacataire seul en **Jeunesse** (sauf 12h-14h)
     - ✅ Sections autorisées par agent
     - ✅ Vacataires uniquement mercredi et samedi
     """)
