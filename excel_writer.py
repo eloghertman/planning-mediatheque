@@ -1192,14 +1192,10 @@ def generate_excel(source_filepath, weeks_data, metadata):
     buf = io.BytesIO()
     wb.save(buf)
 
-    # Convertir inlineStr -> sharedStrings pour Semaine_N ET Planning_Agent
-    # Les formules SUMPRODUCT dans Planning_Agent referecent Semaine_N :
-    # SEARCH("Agent", Semaine_1!C6:C16) ne fonctionne que sur sharedStrings
-    sheets_to_convert = (
-        [f"Semaine_{w['week_num']}" for w in weeks_data] +
-        [f"Planning_Agent_Semaine_{w['week_num']}" for w in weeks_data]
-    )
-    buf = _convert_inlinestr_to_shared_strings(buf, sheets_to_convert, all_sp_cells, weeks_data)
+    # Note : _convert_inlinestr_to_shared_strings n'est plus appelée.
+    # Les formules cross-sheet (IF/SEARCH vers Semaine_N) fonctionnent
+    # nativement sans conversion inlineStr — les cellules Semaine_N
+    # sont des sharedStrings dès que Excel recalcule le fichier.
 
     buf.seek(0)
     return buf
