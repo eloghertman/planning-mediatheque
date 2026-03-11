@@ -437,6 +437,7 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
     nb_jours       = len(jours_presents)
     nb_cols        = 2 + nb_jours
     end_col        = get_column_letter(nb_cols)
+    col_h_total    = nb_cols + 1   # colonne H (ou suivante) = total heures semaine
 
     agents_sorted = sorted(
         [a for a in affectations.keys() if not is_vacataire(a)],
@@ -447,6 +448,7 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
     ws.column_dimensions['B'].width = 15
     for ci in range(3, 3 + nb_jours):
         ws.column_dimensions[get_column_letter(ci)].width = 20
+    ws.column_dimensions[get_column_letter(col_h_total)].width = 12
 
     # Mapping jour → colonne lettre
     col_map = {}
@@ -483,6 +485,52 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
         ('9:00-10:00', 540, 600),
     ]
 
+    # Créneau additionnel après 19h (affiché si agent finit après 19h00)
+    LATE_SLOT = ('19:00-19:30', 1140, 1170)
+
+    # Helper : total heures réellement travaillées sur la semaine
+    # (congés exclus, samedis non roulés exclus, jours sans horaires exclus)
+    def total_heures_semaine(agent):
+        roulement_sem = metadata.get('roulement_all', {}).get(week_num, {})
+        samedi_type   = week_data.get('samedi_type')
+
+        total_min = 0
+        for jour in jours_presents:
+            date = week_dates.get(jour)
+            if not date:
+                continue
+            date_str = date.strftime('%Y-%m-%d')
+
+            # Samedi : vérifier le roulement
+            if jour == 'Samedi':
+                ag_roulement = roulement_sem.get(agent)
+                if ag_roulement and samedi_type:
+                    if ag_roulement not in (samedi_type, 'BOTH'):
+                        continue  # samedi non travaillé ce roulement
+
+            # Congé : si événement couvre ce jour pour cet agent
+            ev_jour = evenements.get(date_str, [])
+            is_conge = any(
+                agent in ev['agents']
+                and ev['nom'].lower() in ('congé', 'conge', 'rtt', 'vacation', 'formation')
+                for ev in ev_jour
+            )
+            if is_conge:
+                continue  # journée non travaillée
+
+            h = horaires_ag.get(agent, {}).get(jour)
+            if not h:
+                continue
+            sm, em, sa, ea = h
+            if sm is not None and em is not None:
+                total_min += em - sm
+            if sa is not None and ea is not None:
+                total_min += ea - sa
+
+        h_int = total_min // 60
+        m_int = total_min % 60
+        return f"{h_int}h{m_int:02d}" if m_int else f"{h_int}h"
+
     # Durées en MINUTES entières pour les créneaux SP (évite pb décimal Excel FR)
     cren_durations_min = [(ce - cs) for (_, cs, ce) in creneaux]
 
@@ -502,6 +550,12 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
                      value=f"  {agent.upper()}   ({sects_label})"),
              bg=hdr_bg, fnt=_font(bold=True, size=11, color=hdr_fc),
              aln=_aln('left'))
+        # Colonne H : total heures travaillées sur la semaine
+        total_h = total_heures_semaine(agent)
+        h_cell = ws.cell(row=row, column=col_h_total)
+        _set(h_cell, value=f"⏱ {total_h}",
+             bg=hdr_bg, fnt=_font(bold=True, size=10, color=hdr_fc),
+             aln=_aln('center'))
         ws.row_dimensions[row].height = 24
         row += 1
 
@@ -834,6 +888,49 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
 
         ws.row_dimensions[row].height = 20
         row += 1
+
+        # ── Créneau tardif (après 19h) ──────────────────────────
+        late_name, ls, le = LATE_SLOT
+        has_late = False
+        for jour in jours_presents:
+            h = horaires_ag.get(agent, {}).get(jour)
+            if h:
+                ea = h[3]  # fin après-midi
+                if ea is not None and ea > 1140:
+                    has_late = True
+                    break
+
+        if has_late:
+            _set(ws.cell(row=row, column=1), bg='F8F9FA')
+            ws.cell(row=row, column=1).value = ''
+            _set(ws.cell(row=row, column=2, value=late_name),
+                 bg='FDFEFE', fnt=_font(bold=True, size=9),
+                 aln=_aln(), brd=_brd())
+            for jour in jours_presents:
+                c    = col_map[jour]
+                cell = ws.cell(row=row, column=c)
+                h    = horaires_ag.get(agent, {}).get(jour)
+                ea   = h[3] if h else None
+                if ea is not None and ea > 1140:
+                    # Finit après 19h → indiquer l'heure précise
+                    _set(cell, value=f"Fin {min_to_hhmm(ea)}",
+                         bg=C['arrival_bg'],
+                         fnt=_font(size=9, bold=True, color=C['arrival_txt']),
+                         aln=_aln(), brd=_brd())
+                elif ea is not None and ea == 1140:
+                    # Finit pile à 19h → bureau vide
+                    _set(cell, value='',
+                         bg=C['bureau_bg'],
+                         fnt=_font(size=8, color=C['gray']),
+                         aln=_aln(), brd=_brd())
+                else:
+                    # Ne travaille pas / finit avant → gris
+                    _set(cell, value='—',
+                         bg=C['off_bg'],
+                         fnt=_font(size=10, color=C['off_txt']),
+                         aln=_aln(), brd=_brd())
+            ws.row_dimensions[row].height = 26
+            row += 1
 
         # ── Séparateur ──────────────────────────────────────────
         for ci in range(1, nb_cols + 1):
