@@ -648,6 +648,39 @@ def explode_planning_type(raw_blocs, creneaux_def):
 #  DISPONIBILITÉ
 # ══════════════════════════════════════════════════════════════
 
+# Fenêtre pause méridienne flexible (samedi)
+FLEX_BREAK_S  = 720   # 12h00
+FLEX_BREAK_E  = 900   # 15h00
+FLEX_BREAK_DUR = 60   # 1h obligatoire
+
+def _has_flexible_break_samedi(agent, horaires_agents):
+    """
+    Retourne True si l'agent bénéficie de la pause flexible samedi :
+    - jour = Samedi
+    - régulier (non vacataire)
+    - a exactement 1h de coupure dans ses horaires qui tombe dans 12h-15h
+    - n'est pas Stéphane
+    """
+    if agent.lower() == 'stéphane':
+        return False
+    if is_vacataire(agent):
+        return False
+    h = horaires_agents.get(agent, {}).get('Samedi')
+    if h is None:
+        return False
+    sm, em, sa, ea = h
+    # L'agent doit avoir un matin ET un après-midi ce jour
+    if None in (sm, em, sa, ea):
+        return False
+    # La coupure = [em, sa]. Elle doit mesurer exactement 1h et être dans 12h-15h
+    break_dur = sa - em
+    if break_dur != FLEX_BREAK_DUR:
+        return False
+    # La coupure doit être entièrement dans la fenêtre 12h-15h
+    if em >= FLEX_BREAK_S and sa <= FLEX_BREAK_E:
+        return True
+    return False
+
 def agent_covers_slot(agent, jour, cs, ce, horaires_agents):
     h = horaires_agents.get(agent, {}).get(jour)
     if h is None:
@@ -655,7 +688,16 @@ def agent_covers_slot(agent, jour, cs, ce, horaires_agents):
     sm, em, sa, ea = h
     in_m = sm is not None and em is not None and cs >= sm and ce <= em
     in_a = sa is not None and ea is not None and cs >= sa and ce <= ea
-    return in_m or in_a
+    if in_m or in_a:
+        return True
+    # Pause flexible samedi : l'agent peut couvrir n'importe quel créneau dans 12h-15h
+    if jour == 'Samedi' and _has_flexible_break_samedi(agent, horaires_agents):
+        # Le créneau doit être dans la fenêtre flexible ET dans les horaires globaux
+        # (entre le début de journée sm et la fin ea)
+        if cs >= FLEX_BREAK_S and ce <= FLEX_BREAK_E:
+            if sm is not None and cs >= sm and ea is not None and ce <= ea:
+                return True
+    return False
 
 def agent_blocked_by_event(agent, cs, ce, date_str, evenements):
     for ev in evenements.get(date_str, []):
@@ -746,21 +788,55 @@ def agent_meridienne_sp_total(agent, cren_idx, creneaux, day_assignments):
             total += (inter_e - inter_s)
     return total
 
+def agent_flex_sp_in_window(agent, cren_idx, creneaux, day_assignments):
+    """SP déjà effectué dans la fenêtre flexible 12h-15h avant cren_idx."""
+    total = 0
+    for i in range(cren_idx):
+        cn, c_cs, c_ce = creneaux[i]
+        if c_ce <= FLEX_BREAK_S or c_cs >= FLEX_BREAK_E:
+            continue
+        inter_s = max(c_cs, FLEX_BREAK_S)
+        inter_e = min(c_ce, FLEX_BREAK_E)
+        if inter_e <= inter_s:
+            continue
+        slot = day_assignments.get(cn)
+        if slot is None:
+            continue
+        all_a = [a for s in SECTIONS for a in slot.get('assignment', {}).get(s, [])]
+        if agent in all_a:
+            total += (inter_e - inter_s)
+    return total
+
 def agent_has_meridienne_pause(agent, cren_idx, creneaux, day_assignments,
                                 horaires_agents, jour):
     """
     D14 (réguliers) + O6 (vacataires) :
-    Au moins 1h sans SP dans la fenêtre 12h-14h.
-    Pour les vacataires : découpable en créneaux de 30min (12h30-13h30 possible).
+    Au moins 1h sans SP dans la fenêtre 12h-14h (jours normaux).
+    Samedi + pause flexible : max 2h SP dans la fenêtre 12h-15h (3h - 1h obligatoire).
     F : Lydie et Delphine sont exemptées — peuvent travailler en continu 10h-14h.
     """
     # F : exemption Lydie et Delphine
     if agent.lower() in AGENTS_EXCEPTION_MERIDIENNE:
         return True
 
-    MER_S, MER_E = 720, 840
     _, cs, ce = creneaux[cren_idx]
 
+    # ── Pause flexible samedi ────────────────────────────────────────────
+    if jour == 'Samedi' and _has_flexible_break_samedi(agent, horaires_agents):
+        # Fenêtre 12h-15h : max 2h de SP (= 3h - 1h de pause obligatoire)
+        if ce <= FLEX_BREAK_S or cs >= FLEX_BREAK_E:
+            return True  # créneau hors fenêtre flexible → OK
+        inter_s = max(cs, FLEX_BREAK_S)
+        inter_e = min(ce, FLEX_BREAK_E)
+        slot_in_flex = inter_e - inter_s if inter_e > inter_s else 0
+        sp_already = agent_flex_sp_in_window(agent, cren_idx, creneaux, day_assignments)
+        # Max 2h (120 min) de SP dans la fenêtre
+        if sp_already + slot_in_flex > FLEX_BREAK_E - FLEX_BREAK_S - FLEX_BREAK_DUR:
+            return False
+        return True
+
+    # ── Règle standard 12h-14h ──────────────────────────────────────────
+    MER_S, MER_E = 720, 840
     if ce <= MER_S or cs >= MER_E:
         return True  # Créneau hors fenêtre méridienne
 
@@ -869,11 +945,14 @@ def find_replacement(section, jour, cs, ce, date_str,
                      exclude=None, vac_day_sp=None,
                      force_vacataire=False,
                      allow_any_section=False,   # D16
-                     vac_prioritaire=False):    # O6 : vacataire prioritaire sur réguliers
+                     vac_prioritaire=False,     # O6 : vacataire prioritaire sur réguliers
+                     vac_section_jour=None):    # R1/R2/R3 : section dédiée par vacataire
     """
     Cherche le meilleur agent pour une section/créneau.
     allow_any_section=True : D16, accepter tout agent disponible même non habilité.
     vac_prioritaire=True : O6, vacataire avant tous les réguliers.
+    vac_section_jour : dict {agent: section_dédiée} — les vacataires sont exclus
+                       des sections hors leur dédiée (sauf D16).
     """
     exclude    = set(exclude or [])
     vac_day_sp = vac_day_sp or {}
@@ -928,24 +1007,33 @@ def find_replacement(section, jour, cs, ce, date_str,
             continue
 
         # Critères de tri
-        # (out_of_section remplacé par rouge_score basé sur la catégorie)
-
-        if is_vacataire(agent):
-            prim = 0  # O2 exception vacataires : pas de priorité section
-        else:
-            prim = 0 if (agent_sects and agent_sects[0] == section) else 1  # O2
-
         # Rouge : agent hors section sans alerte → pénalisé fort (D16)
         rouge_score = 1 if is_section_rouge(agent, section, affectations, categories) else 0
 
-        # O6 : score vacataire
-        # - vac_prioritaire=True → vacataire avant régulier (score 0 vs 1)
-        # - force_vacataire → idem
-        # - sinon → régulier avant vacataire (score 0 vs 1)
-        if vac_prioritaire or force_vacataire:
-            vac_score = 0 if is_vacataire(agent) else 1
+        # ── R1/R2/R3 : gestion vacataires avec section dédiée ──────────────
+        # priority_score unifie vac_score + prim en un seul critère :
+        #   0 = régulier en section primaire
+        #   1 = vacataire dans sa section dédiée (R1 : avant section secondaire)
+        #   2 = régulier en section secondaire
+        #   3 = vacataire hors section dédiée (R2 : dernier recours, D16 uniquement)
+        vac_section_jour = vac_section_jour or {}
+        if is_vacataire(agent):
+            # Trouver la section dédiée de ce vacataire
+            _vkey = next((k for k in vac_section_jour if k.lower() == agent.lower()), None)
+            dedicated = vac_section_jour.get(_vkey)
+
+            if dedicated is not None and dedicated != section:
+                # R2/R3 : vacataire hors sa section dédiée
+                if not allow_any_section:
+                    continue  # R2 : exclure sauf D16
+                priority_score = 3  # D16 fallback uniquement
+            elif vac_prioritaire or force_vacataire:
+                priority_score = 0  # O6 : vacataire prioritaire
+            else:
+                priority_score = 1  # R1 : entre primaire régulier et secondaire régulier
         else:
-            vac_score = 1 if is_vacataire(agent) else 0
+            # Régulier : primaire=0, secondaire=2
+            priority_score = 0 if (agent_sects and agent_sects[0] == section) else 2
 
         # Priorité vacataire : Vacataire 1 avant Vacataire 2
         vac_order = 0
@@ -964,7 +1052,6 @@ def find_replacement(section, jour, cs, ce, date_str,
                                                 day_assignments, horaires_agents, jour)
 
         # C+D+E : Continuité par blocs horaires
-        # Bloc courant pour ce créneau
         bloc_courant = get_bloc_id(jour, cs)
         continuity = 0.0
         if cren_idx > 0:
@@ -982,9 +1069,8 @@ def find_replacement(section, jour, cs, ce, date_str,
 
         candidates.append((
             rouge_score,     # Catégorie : sans-alerte avant rouge (D16)
-            vac_score,       # O6 : vacataire prioritaire ou non
+            priority_score,  # R1/R2/R3 : prim-régulier < vac-dédié < sec-régulier < vac-hors-dédié
             vac_order,       # Vac1 avant Vac2
-            prim,            # O2 : section primaire
             sp_semaine,      # E/O3 : équité semaine (prime sur continuité)
             continuity,      # E : intra-bloc = bonus, inter-bloc = malus léger
             over_ideal,      # O7
@@ -1313,6 +1399,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             vac_day_sp=vac_day_sp,
                             force_vacataire=force_vac,
                             vac_prioritaire=vac_present_jour,
+                            vac_section_jour=vac_section_jour,
                         )
                         if repl:
                             final.append(repl)
@@ -1322,6 +1409,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
 
             # ══ PASSE A2 : optimisation section primaire (O2) ══
             # Si un agent est en section non-primaire ET sa section primaire est vide → le déplacer
+            # CONDITION : la section abandonnée doit pouvoir être couverte par quelqu'un d'autre
             for section in ['RDC', 'Adulte', 'MF']:
                 agents_here = list(assignment.get(section, []))
                 for agent in agents_here:
@@ -1335,6 +1423,19 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         continue  # section primaire = Jeunesse ou autre
                     if assignment.get(prim_sect):
                         continue  # section primaire déjà couverte
+                    # Vérifier qu'il existe un remplaçant pour la section abandonnée
+                    # avant de procéder au déplacement
+                    has_replacement = any(
+                        a != agent
+                        and a not in assigned_this
+                        and section in affectations.get(a, [])
+                        and not is_section_rouge(a, section, affectations, categories)
+                        and agent_available(a, jour, cs, ce, date_str, horaires_agents, evenements)
+                        and sp_count.get(a, 0) + slot_min <= sp_max_min.get(a, 99*60)
+                        for a in eligible
+                    )
+                    if not has_replacement:
+                        continue  # pas de remplaçant → ne pas déplacer, RDC/MF ne doit pas rester vide
                     # Déplacer l'agent vers sa section primaire
                     assignment[section].remove(agent)
                     assignment[prim_sect] = [agent]
@@ -1371,6 +1472,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     exclude=assigned_this,
                     vac_day_sp=vac_day_sp,
                     vac_prioritaire=vac_present_jour,
+                    vac_section_jour=vac_section_jour,
                 )
                 if repl:
                     assignment[section] = [repl]
@@ -1507,6 +1609,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             exclude=assigned_this,
                             vac_day_sp=vac_day_sp,
                             vac_prioritaire=vac_present_jour,
+                            vac_section_jour=vac_section_jour,
                         )
                         if repl and not is_vacataire(repl):
                             found_regular = repl
@@ -1569,6 +1672,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         vac_day_sp=vac_day_sp,
                         allow_any_section=True,  # D16
                         vac_prioritaire=vac_present_jour,
+                        vac_section_jour=vac_section_jour,
                     )
                     if repl:
                         assignment[section] = [repl]
@@ -1733,18 +1837,28 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                 sect_ags = assignment.get(section, [])
                 if len(sect_ags) == 1 and is_vacataire(sect_ags[0]):
                     # Calculer durée consécutive vacataire seul dans cette section
+                    # On compare chaque créneau précédent à son successeur direct (pas au créneau courant)
                     consec_seul = slot_min
+                    next_cs = cs  # début du créneau qu'on vient de traiter
                     for prev_cn, prev_cs_v, prev_ce_v in reversed(creneaux[:cren_idx]):
                         prev_sl = day_assignments.get(prev_cn)
                         if not prev_sl: break
-                        if prev_ce_v < cs - 1: break  # gap → stop
+                        if prev_ce_v < next_cs - 1: break  # gap entre ce créneau et le suivant → stop
                         prev_sect_ags = prev_sl.get('assignment', {}).get(section, [])
                         if len(prev_sect_ags) == 1 and is_vacataire(prev_sect_ags[0]):
                             consec_seul += prev_ce_v - prev_cs_v
+                            next_cs = prev_cs_v  # reculer le curseur
                         else:
                             break
                     if consec_seul > VAC_SEUL_MAX:
-                        # Chercher un régulier à ajouter
+                        # Chercher un régulier pour remplacer le vacataire
+                        # exclude = uniquement les agents déjà placés dans d'AUTRES
+                        # sections à CE créneau (pas assigned_this qui cumule
+                        # des agents de créneaux précédents et bloquerait Delphine etc.)
+                        exclude_cren = set(
+                            ag for s in SECTIONS if s != section
+                            for ag in assignment.get(s, [])
+                        )
                         repl, _ = find_replacement(
                             section=section, jour=jour, cs=cs, ce=ce,
                             date_str=date_str, eligible=eligible,
@@ -1755,7 +1869,8 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             creneaux=creneaux, cren_idx=cren_idx,
                             day_assignments=day_assignments,
                             max_court=max_court, max_long=max_long,
-                            exclude=assigned_this, vac_day_sp=vac_day_sp,
+                            exclude=exclude_cren, vac_day_sp=vac_day_sp,
+                            vac_section_jour=vac_section_jour,
                         )
                         if repl and not is_vacataire(repl):
                             assignment[section] = [repl]
