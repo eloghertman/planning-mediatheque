@@ -1359,7 +1359,11 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     must_replace = False
                     force_vac    = False
 
-                    if not agent_available(agent_resolved, jour, cs, ce, date_str,
+                    # D9 : vérifier l'éligibilité samedi (roulement ROUGE/BLEU)
+                    # Un agent du planning type peut y figurer mais ne pas travailler ce samedi
+                    if jour == 'Samedi' and agent_resolved not in eligible:
+                        must_replace = True
+                    elif not agent_available(agent_resolved, jour, cs, ce, date_str,
                                            horaires_agents, evenements):
                         must_replace = True
                     elif sp_count.get(agent_resolved, 0) + slot_min > sp_max_min.get(agent_resolved, 99*60):
@@ -1922,6 +1926,12 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             date = week_dates.get(jour)
             if date is None:
                 continue
+            # O8 : vérifier le roulement samedi
+            if jour == 'Samedi':
+                sam_type_o8 = result.get('Samedi', {}).get('_samedi_type') or samedi_type
+                agent_roul = roulement_semaine.get(agent)
+                if agent_roul and agent_roul not in (sam_type_o8, 'BOTH'):
+                    continue
             date_str = date.strftime('%Y-%m-%d')
             is_vac_day_o8 = jour.lower() in vac_days
             for cren_idx, (cren_name, cs, ce) in enumerate(creneaux):
