@@ -946,13 +946,16 @@ def find_replacement(section, jour, cs, ce, date_str,
                      force_vacataire=False,
                      allow_any_section=False,   # D16
                      vac_prioritaire=False,     # O6 : vacataire prioritaire sur réguliers
-                     vac_section_jour=None):    # R1/R2/R3 : section dédiée par vacataire
+                     vac_section_jour=None,     # R1/R2/R3 : section dédiée par vacataire
+                     planning_type_base=None,   # pour le score PT : éviter agents déjà prévus dans le bloc
+                     pt_key=None):              # clé du planning type (jour ou Samedi_ROUGE)
     """
     Cherche le meilleur agent pour une section/créneau.
     allow_any_section=True : D16, accepter tout agent disponible même non habilité.
     vac_prioritaire=True : O6, vacataire avant tous les réguliers.
     vac_section_jour : dict {agent: section_dédiée} — les vacataires sont exclus
                        des sections hors leur dédiée (sauf D16).
+    planning_type_base : pour déprioritiser les agents déjà prévus dans le bloc PT courant.
     """
     exclude    = set(exclude or [])
     vac_day_sp = vac_day_sp or {}
@@ -1067,16 +1070,35 @@ def find_replacement(section, jour, cs, ce, date_str,
                     else:
                         continuity = +0.5  # malus léger : bloc différent → préférer rotation
 
+        # Score planning type : préférer un agent peu présent dans le PT ce jour/section.
+        # Principe : si on remplace Léa en Adulte 10h-12h, Christine (0 créneau PT Adulte
+        # ce jour) est préférable à AF (6 créneaux PT Adulte ce jour).
+        # On compte les créneaux PT de la JOURNÉE ENTIÈRE pour cet agent/section.
+        # Uniquement pour les réguliers (les vacataires ont leur propre logique).
+        pt_already_score = 0
+        if planning_type_base and pt_key and not is_vacataire(agent):
+            pt_base = planning_type_base.get(pt_key, {})
+            # Compter les créneaux de la journée où l'agent figure dans le PT pour cette section
+            pt_day_count = 0
+            for pt_cn, pt_cs, pt_ce in creneaux:
+                pt_slot = pt_base.get(pt_cn, {})
+                if agent in pt_slot.get(section, []):
+                    pt_day_count += 1
+            # Score proportionnel : plus l'agent est prévu dans le PT, moins il est prioritaire
+            # pour les créneaux de remplacement (on préfère les agents peu chargés dans le PT)
+            pt_already_score = pt_day_count
+
         candidates.append((
-            rouge_score,     # Catégorie : sans-alerte avant rouge (D16)
-            priority_score,  # R1/R2/R3 : prim-régulier < vac-dédié < sec-régulier < vac-hors-dédié
-            vac_order,       # Vac1 avant Vac2
-            sp_semaine,      # E/O3 : équité semaine (prime sur continuité)
-            continuity,      # E : intra-bloc = bonus, inter-bloc = malus léger
-            over_ideal,      # O7
-            mer_score,       # O6 pause méridienne
-            sp_jour,         # O3/O4 : équité journée
-            court_cren,      # O5
+            rouge_score,      # Catégorie : sans-alerte avant rouge (D16)
+            priority_score,   # R1/R2/R3 : prim-régulier < vac-dédié < sec-régulier < vac-hors-dédié
+            vac_order,        # Vac1 avant Vac2
+            pt_already_score, # PT : préférer agent absent du bloc PT courant pour cette section
+            sp_semaine,       # E/O3 : équité semaine
+            continuity,       # E : intra-bloc = bonus, inter-bloc = malus léger
+            over_ideal,       # O7
+            mer_score,        # O6 pause méridienne
+            sp_jour,          # O3/O4 : équité journée
+            court_cren,       # O5
             agent
         ))
 
@@ -1404,6 +1426,8 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             force_vacataire=force_vac,
                             vac_prioritaire=vac_present_jour,
                             vac_section_jour=vac_section_jour,
+                            planning_type_base=planning_type_base,
+                            pt_key=pt_key,
                         )
                         if repl:
                             final.append(repl)
@@ -1477,6 +1501,8 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     vac_day_sp=vac_day_sp,
                     vac_prioritaire=vac_present_jour,
                     vac_section_jour=vac_section_jour,
+                    planning_type_base=planning_type_base,
+                    pt_key=pt_key,
                 )
                 if repl:
                     assignment[section] = [repl]
@@ -1614,6 +1640,8 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             vac_day_sp=vac_day_sp,
                             vac_prioritaire=vac_present_jour,
                             vac_section_jour=vac_section_jour,
+                            planning_type_base=planning_type_base,
+                            pt_key=pt_key,
                         )
                         if repl and not is_vacataire(repl):
                             found_regular = repl
@@ -1677,6 +1705,8 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         allow_any_section=True,  # D16
                         vac_prioritaire=vac_present_jour,
                         vac_section_jour=vac_section_jour,
+                        planning_type_base=planning_type_base,
+                        pt_key=pt_key,
                     )
                     if repl:
                         assignment[section] = [repl]
@@ -1875,6 +1905,8 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             max_court=max_court, max_long=max_long,
                             exclude=exclude_cren, vac_day_sp=vac_day_sp,
                             vac_section_jour=vac_section_jour,
+                            planning_type_base=planning_type_base,
+                            pt_key=pt_key,
                         )
                         if repl and not is_vacataire(repl):
                             assignment[section] = [repl]
