@@ -1054,7 +1054,10 @@ def find_replacement(section, jour, cs, ce, date_str,
         _, mer_score = vacataire_meridienne_ok(agent, cren_idx, creneaux,
                                                 day_assignments, horaires_agents, jour)
 
-        # C+D+E : Continuité par blocs horaires
+        # Continuité intra-bloc : bonus si l'agent était dans cette section au créneau précédent
+        # ET que les deux créneaux sont dans le même bloc horaire
+        # ET que le consécutif courant est < 3h (au-delà on préfère la rotation)
+        # S'applique aux réguliers ET aux vacataires.
         bloc_courant = get_bloc_id(jour, cs)
         continuity = 0.0
         if cren_idx > 0:
@@ -1066,38 +1069,39 @@ def find_replacement(section, jour, cs, ce, date_str,
                 if agent in prev_agents:
                     bloc_prev = get_bloc_id(jour, prev_cs)
                     if bloc_prev == bloc_courant:
-                        continuity = -1.0  # bonus fort : même bloc → maintenir
+                        # Même bloc : bonus seulement si consécutif < 3h
+                        consec_before = get_consecutive_sp_before(
+                            agent, cren_idx, creneaux, day_assignments)
+                        if consec_before < 180:
+                            continuity = -1.0  # bonus : maintenir l'agent dans sa section
+                        # else : consécutif ≥ 3h → pas de bonus, on préfère la rotation
                     else:
                         continuity = +0.5  # malus léger : bloc différent → préférer rotation
 
         # Score planning type : préférer un agent peu présent dans le PT ce jour/section.
         # Principe : si on remplace Léa en Adulte 10h-12h, Christine (0 créneau PT Adulte
         # ce jour) est préférable à AF (6 créneaux PT Adulte ce jour).
-        # On compte les créneaux PT de la JOURNÉE ENTIÈRE pour cet agent/section.
         # Uniquement pour les réguliers (les vacataires ont leur propre logique).
         pt_already_score = 0
         if planning_type_base and pt_key and not is_vacataire(agent):
             pt_base = planning_type_base.get(pt_key, {})
-            # Compter les créneaux de la journée où l'agent figure dans le PT pour cette section
             pt_day_count = 0
             for pt_cn, pt_cs, pt_ce in creneaux:
                 pt_slot = pt_base.get(pt_cn, {})
                 if agent in pt_slot.get(section, []):
                     pt_day_count += 1
-            # Score proportionnel : plus l'agent est prévu dans le PT, moins il est prioritaire
-            # pour les créneaux de remplacement (on préfère les agents peu chargés dans le PT)
             pt_already_score = pt_day_count
 
         candidates.append((
             rouge_score,      # Catégorie : sans-alerte avant rouge (D16)
             priority_score,   # R1/R2/R3 : prim-régulier < vac-dédié < sec-régulier < vac-hors-dédié
             vac_order,        # Vac1 avant Vac2
-            pt_already_score, # PT : préférer agent absent du bloc PT courant pour cette section
-            sp_semaine,       # E/O3 : équité semaine
-            continuity,       # E : intra-bloc = bonus, inter-bloc = malus léger
+            continuity,       # Continuité intra-bloc (prime sur PT-score si consécutif < 3h)
+            pt_already_score, # PT : préférer agent absent du PT ce jour pour cette section
+            sp_semaine,       # O3 : équité semaine
             over_ideal,       # O7
-            mer_score,        # O6 pause méridienne
-            sp_jour,          # O3/O4 : équité journée
+            mer_score,        # pause méridienne vacataire
+            sp_jour,          # O4 : équité journée
             court_cren,       # O5
             agent
         ))
@@ -1395,9 +1399,9 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                                               section, date_str, affectations,
                                               evenements, horaires_agents):
                         must_replace = True
-                    elif not agent_has_meridienne_pause(agent_resolved, cren_idx, creneaux,
-                                                         day_assignments, horaires_agents, jour):
-                        must_replace = True
+                    # O1 prime sur D14 : la pause méridienne n'est PAS vérifiée en Passe A.
+                    # Si l'agent est dans le planning type et disponible, on le valide.
+                    # D14 reste active pour les remplaçants (find_replacement).
                     elif is_vac_day and not is_vacataire(agent_resolved):
                         consec = get_consecutive_sp_before(
                             agent_resolved, cren_idx, creneaux, day_assignments)
