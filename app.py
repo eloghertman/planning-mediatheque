@@ -175,7 +175,7 @@ if uploaded_file is not None:
             )
             raw      = load_excel_data(file_buf)
             params   = parse_parametres(raw)
-            affecta, _categories = parse_affectations(raw)
+            affecta, _categories, _responsables = parse_affectations(raw)
             roulem   = parse_roulement_samedi(raw)
 
         col1, col2, col3 = st.columns(3)
