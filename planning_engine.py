@@ -239,26 +239,24 @@ def parse_horaires_ouverture(data):
 
 def parse_affectations(data):
     """
-    Retourne (affectations, categories) :
+    Retourne (affectations, categories, responsables) :
       affectations : {agent: [section1, section2, ...]}  (ordre = priorité)
       categories   : {agent: str|None}  (A, B, C, C2, ou None pour vacataires)
+      responsables : set of agent names having 'OUI' in the Responsable column
 
-    Format Excel attendu : Agent | Catégorie | Section1 | Section2 | ...
-    Si la colonne Catégorie est absente (ancien format à 1 col d'agent + sections),
-    on retourne categories={} et on lit depuis col 1.
-    Les colonnes de notes (contenant ":", "→", ou >20 chars) sont ignorées.
+    Format Excel : Agent | Catégorie | Section1..4 | Responsable
     """
     df = data['Affectations']
     result = {}
     categories = {}
+    responsables = set()
 
-    # Détecter la présence de la colonne Catégorie en lisant la 1ère ligne de données
+    # Détecter la présence de la colonne Catégorie
     has_cat = False
     for _, row in df.iterrows():
         agent_val = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ''
         if agent_val in ('', 'nan', 'Agent'):
             continue
-        # Si la 2ème valeur est une lettre unique ou C2 → c'est une catégorie
         if len(row) > 1:
             v2 = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ''
             if v2 in ('A', 'B', 'C', 'C2', ''):
@@ -277,15 +275,21 @@ def parse_affectations(data):
             categories[agent] = v if v not in ('nan', '') else None
         else:
             categories[agent] = None
-        # Sections (ignorer colonnes de notes)
+        # Sections (ignorer colonnes de notes et colonne Responsable)
         sections = []
         for i in range(sect_start, len(row)):
             v = str(row.iloc[i]).strip() if pd.notna(row.iloc[i]) else ''
-            if v and v not in ('nan',) and len(v) <= 20 and ':' not in v and '→' not in v:
+            if not v or v in ('nan',):
+                continue
+            # Colonne Responsable : valeur OUI → marquer l'agent, ne pas ajouter comme section
+            if v.upper() == 'OUI':
+                responsables.add(agent)
+                continue
+            if len(v) <= 20 and ':' not in v and '→' not in v:
                 sections.append(v)
         if sections:
             result[agent] = sections
-    return result, categories
+    return result, categories, responsables
 
 
 def get_sections_sans_alerte(agent, affectations, categories):
@@ -947,8 +951,9 @@ def find_replacement(section, jour, cs, ce, date_str,
                      allow_any_section=False,   # D16
                      vac_prioritaire=False,     # O6 : vacataire prioritaire sur réguliers
                      vac_section_jour=None,     # R1/R2/R3 : section dédiée par vacataire
-                     planning_type_base=None,   # pour le score PT : éviter agents déjà prévus dans le bloc
-                     pt_key=None):              # clé du planning type (jour ou Samedi_ROUGE)
+                     planning_type_base=None,   # pour le score PT
+                     pt_key=None,               # clé du planning type
+                     responsables=None):        # set d'agents responsables de section
     """
     Cherche le meilleur agent pour une section/créneau.
     allow_any_section=True : D16, accepter tout agent disponible même non habilité.
@@ -1078,6 +1083,22 @@ def find_replacement(section, jour, cs, ce, date_str,
                     else:
                         continuity = +0.5  # malus léger : bloc différent → préférer rotation
 
+        # Score responsable : les agents responsables de section sont utilisés
+        # en dernier recours (hors leurs créneaux PT) — tant que d'autres agents
+        # non responsables sont disponibles et sous leur max SP.
+        # Un responsable dans le PT à ce créneau → responsible_score=0 (normal).
+        # Un responsable hors PT → responsible_score=1 (déprioritisé).
+        responsible_score = 0
+        if responsables and not is_vacataire(agent) and agent in responsables:
+            # Vérifier si l'agent est dans le PT pour ce créneau/section
+            in_pt = False
+            if planning_type_base and pt_key:
+                pt_slot = planning_type_base.get(pt_key, {}).get(
+                    creneaux[cren_idx][0], {})
+                in_pt = agent in pt_slot.get(section, [])
+            if not in_pt:
+                responsible_score = 1  # hors PT → déprioritisé
+
         # Score planning type : préférer un agent peu présent dans le PT ce jour/section.
         # Principe : si on remplace Léa en Adulte 10h-12h, Christine (0 créneau PT Adulte
         # ce jour) est préférable à AF (6 créneaux PT Adulte ce jour).
@@ -1093,16 +1114,17 @@ def find_replacement(section, jour, cs, ce, date_str,
             pt_already_score = pt_day_count
 
         candidates.append((
-            rouge_score,      # Catégorie : sans-alerte avant rouge (D16)
-            priority_score,   # R1/R2/R3 : prim-régulier < vac-dédié < sec-régulier < vac-hors-dédié
-            vac_order,        # Vac1 avant Vac2
-            continuity,       # Continuité intra-bloc (prime sur PT-score si consécutif < 3h)
-            pt_already_score, # PT : préférer agent absent du PT ce jour pour cette section
-            sp_semaine,       # O3 : équité semaine
-            over_ideal,       # O7
-            mer_score,        # pause méridienne vacataire
-            sp_jour,          # O4 : équité journée
-            court_cren,       # O5
+            rouge_score,        # Catégorie : sans-alerte avant rouge (D16)
+            priority_score,     # R1/R2/R3 : prim-régulier < vac-dédié < sec-régulier < vac-hors-dédié
+            vac_order,          # Vac1 avant Vac2
+            continuity,         # Continuité intra-bloc (prime sur PT-score si consécutif < 3h)
+            responsible_score,  # 0=non-responsable, 1=responsable hors PT (utilisé en dernier)
+            pt_already_score,   # PT : préférer agent absent du PT ce jour pour cette section
+            sp_semaine,         # O3 : équité semaine
+            over_ideal,         # O7
+            mer_score,          # pause méridienne vacataire
+            sp_jour,            # O4 : équité journée
+            court_cren,         # O5
             agent
         ))
 
@@ -1195,7 +1217,8 @@ def vac_is_demi_journee(agent, jour, horaires_agents):
 def plan_week(week_num, week_dates, planning_type_base, samedi_type,
               affectations, categories, horaires_agents, horaires_ouverture,
               besoins_jeunesse, sp_minmax_week, roulement_semaine,
-              evenements, params, creneaux, semaine_type):
+              evenements, params, creneaux, semaine_type,
+              responsables=None):
 
     max_court = parse_duration_param(params.get('Durée_SP_max_idéale', '2h30'), 150)
     max_long  = parse_duration_param(params.get('Durée_SP_max_tolérée', '4h'), 240)
@@ -1432,6 +1455,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             vac_section_jour=vac_section_jour,
                             planning_type_base=planning_type_base,
                             pt_key=pt_key,
+                            responsables=responsables,
                         )
                         if repl:
                             final.append(repl)
@@ -1507,6 +1531,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     vac_section_jour=vac_section_jour,
                     planning_type_base=planning_type_base,
                     pt_key=pt_key,
+                    responsables=responsables,
                 )
                 if repl:
                     assignment[section] = [repl]
@@ -1646,6 +1671,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             vac_section_jour=vac_section_jour,
                             planning_type_base=planning_type_base,
                             pt_key=pt_key,
+                            responsables=responsables,
                         )
                         if repl and not is_vacataire(repl):
                             found_regular = repl
@@ -1711,6 +1737,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         vac_section_jour=vac_section_jour,
                         planning_type_base=planning_type_base,
                         pt_key=pt_key,
+                        responsables=responsables,
                     )
                     if repl:
                         assignment[section] = [repl]
@@ -1911,6 +1938,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             vac_section_jour=vac_section_jour,
                             planning_type_base=planning_type_base,
                             pt_key=pt_key,
+                            responsables=responsables,
                         )
                         if repl and not is_vacataire(repl):
                             assignment[section] = [repl]
@@ -2162,7 +2190,7 @@ def compute_full_planning(filepath):
     raw              = load_excel_data(filepath)
     params           = parse_parametres(raw)
     horaires_ouv     = parse_horaires_ouverture(raw)
-    affectations, categories = parse_affectations(raw)
+    affectations, categories, responsables = parse_affectations(raw)
     horaires_agents  = parse_horaires_agents(raw)
     besoins_j        = parse_besoins_jeunesse(raw)
     sp_minmax_all    = parse_sp_minmax(raw)
@@ -2206,6 +2234,7 @@ def compute_full_planning(filepath):
             params             = params,
             creneaux           = creneaux,
             semaine_type       = semaine_type,
+            responsables       = responsables,
         )
         results.append({
             'week_num':    week_num,
@@ -2231,5 +2260,6 @@ def compute_full_planning(filepath):
         'evenements':      evenements,
         'besoins_j':       besoins_j,
         'semaines_type':   semaines_type,
+        'responsables':    responsables,
     }
     return results, metadata
