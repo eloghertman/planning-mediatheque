@@ -577,7 +577,7 @@ def parse_planning_type(data):
         'RDC':      [2],
         'Adulte':   [3],
         'MF':       [5, 6],
-        'Jeunesse': [7, 8, 9],
+        'Jeunesse': [7, 8, 9, 10],  # jusqu'à 4 agents Jeunesse possible
     }
     JOUR_MAP = {'MARDI':'Mardi','MERCREDI':'Mercredi','JEUDI':'Jeudi','VENDREDI':'Vendredi'}
     SKIP = {'nan','','R D C','Adulte','Musique & Films','Jeunesse','12H30','15H30','NaN'}
@@ -596,8 +596,15 @@ def parse_planning_type(data):
             continue
         if cell0 == 'SAMEDI':
             samedi_count += 1
-            current_jour = 'Samedi_ROUGE' if samedi_count == 1 else 'Samedi_BLEU'
-            raw_blocs[current_jour] = []
+            if samedi_count == 1:
+                current_jour = 'Samedi_ROUGE'
+                raw_blocs[current_jour] = []
+            elif samedi_count == 2:
+                current_jour = 'Samedi_BLEU'
+                raw_blocs[current_jour] = []
+            else:
+                # Tableaux SAMEDI supplémentaires (ex: planning indicatif) → ignorés
+                current_jour = None
             continue
         if not current_jour or not cell1 or cell1 in SKIP:
             continue
@@ -608,6 +615,12 @@ def parse_planning_type(data):
                 if ci < len(row):
                     v = str(row.iloc[ci]).strip() if pd.notna(row.iloc[ci]) else ''
                     if v and v not in SKIP:
+                        # Ignorer les valeurs numériques (durées indicatives dans certains PT)
+                        try:
+                            float(v)
+                            continue  # c'est un nombre → pas un agent
+                        except ValueError:
+                            pass
                         # Extraire juste le nom (ignorer "à partir de Xh")
                         agent_raw = v.split(' à ')[0].split(' à partir')[0].strip()
                         agent = normalize_agent_name(agent_raw)
@@ -641,7 +654,10 @@ def explode_planning_type(raw_blocs, creneaux_def):
                 continue
             for cren_name, cs, ce in creneaux_def:
                 if cs >= bs and ce <= be:
-                    if cren_name not in result[jour_key]:
+                    # Le dernier bloc non-vide l'emporte — les blocs vides (durées filtrées)
+                    # ne doivent pas écraser les blocs avec agents
+                    has_agents = any(agents for agents in bloc_assignment.values())
+                    if cren_name not in result[jour_key] or has_agents:
                         result[jour_key][cren_name] = {
                             s: list(agents) for s, agents in bloc_assignment.items()
                         }
@@ -1099,9 +1115,11 @@ def find_replacement(section, jour, cs, ce, date_str,
             if not in_pt:
                 responsible_score = 1  # hors PT → déprioritisé
 
-        # Score planning type : préférer un agent peu présent dans le PT ce jour/section.
-        # Principe : si on remplace Léa en Adulte 10h-12h, Christine (0 créneau PT Adulte
-        # ce jour) est préférable à AF (6 créneaux PT Adulte ce jour).
+        # Score planning type : préférer un agent peu présent dans le PT ce jour.
+        # On compte les créneaux PT TOUTES SECTIONS pour cet agent ce jour.
+        # Principe : Christine (0 créneau dans le PT ROUGE) est préférable à Macha
+        # (6 créneaux PT ROUGE en RDC) pour remplacer Léa en Adulte — car prendre
+        # Macha la déplace de son rôle PT, alors que Christine est entièrement libre.
         # Uniquement pour les réguliers (les vacataires ont leur propre logique).
         pt_already_score = 0
         if planning_type_base and pt_key and not is_vacataire(agent):
@@ -1109,8 +1127,10 @@ def find_replacement(section, jour, cs, ce, date_str,
             pt_day_count = 0
             for pt_cn, pt_cs, pt_ce in creneaux:
                 pt_slot = pt_base.get(pt_cn, {})
-                if agent in pt_slot.get(section, []):
-                    pt_day_count += 1
+                # Compter toutes les sections, pas seulement la section cible
+                for pt_sect, pt_agents in pt_slot.items():
+                    if agent in pt_agents:
+                        pt_day_count += 1
             pt_already_score = pt_day_count
 
         candidates.append((
@@ -1229,10 +1249,17 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
     is_sam_week = 'Samedi' in week_dates
 
     # D6 : SP min/max en minutes
+    # Si l'agent ne travaille pas le samedi (mauvais roulement), utiliser MarVen même
+    # en semaine avec samedi — les colonnes MarSam ne s'appliquent qu'aux agents roulés.
     sp_max_min = {}
     sp_min_min = {}
     for agent, mm in sp_minmax_week.items():
-        if is_sam_week:
+        agent_roul = roulement_semaine.get(agent, 'BOTH')
+        travaille_sam = (
+            is_sam_week and
+            (agent_roul == 'BOTH' or agent_roul == samedi_type)
+        )
+        if travaille_sam:
             sp_max_min[agent] = mm['Max_MarSam'] * 60
             sp_min_min[agent] = mm['Min_MarSam'] * 60
         else:
@@ -1422,15 +1449,10 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                                               section, date_str, affectations,
                                               evenements, horaires_agents):
                         must_replace = True
-                    # O1 prime sur D14 : la pause méridienne n'est PAS vérifiée en Passe A.
+                    # O1 prime sur D14 ET sur le remplacement par vacataire en Passe A.
                     # Si l'agent est dans le planning type et disponible, on le valide.
-                    # D14 reste active pour les remplaçants (find_replacement).
-                    elif is_vac_day and not is_vacataire(agent_resolved):
-                        consec = get_consecutive_sp_before(
-                            agent_resolved, cren_idx, creneaux, day_assignments)
-                        if consec >= max_court:
-                            force_vac    = True
-                            must_replace = True
+                    # D14 et force_vac ne s'appliquent qu'aux remplaçants (find_replacement)
+                    # et aux créneaux hors PT.
 
                     if not must_replace:
                         final.append(agent_resolved)
@@ -1978,9 +2000,16 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
         if is_vacataire(agent):
             continue
         mm     = sp_minmax_week.get(agent, {})
-        min_sp = (mm['Min_MarSam'] if is_sam_week else mm['Min_MarVen']) * 60
-        max_sp = (mm['Max_MarSam'] if is_sam_week else mm['Max_MarVen']) * 60
+        agent_roul_o8 = roulement_semaine.get(agent, 'BOTH')
+        travaille_sam_o8 = (
+            is_sam_week and
+            (agent_roul_o8 == 'BOTH' or agent_roul_o8 == samedi_type)
+        )
+        min_sp = (mm['Min_MarSam'] if travaille_sam_o8 else mm['Min_MarVen']) * 60
+        max_sp = (mm['Max_MarSam'] if travaille_sam_o8 else mm['Max_MarVen']) * 60
         actual = sp_count.get(agent, 0)
+        # O8 : viser le MIN SP (objectif idéal).
+        # Le MAX reste une limite absolue (D6). L'alerte est générée si min non atteint.
         if actual >= min_sp:
             continue
 
