@@ -14,10 +14,13 @@ import io
 import re
 import zipfile
 from openpyxl import load_workbook
+from copy import copy
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.utils import get_column_letter
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from collections import defaultdict
 
 SECTIONS   = ['RDC', 'Adulte', 'MF', 'Jeunesse']
@@ -34,7 +37,7 @@ C = {
     'jeunesse':   'FFE0E0',          # onglet Semaine (inchangé, repère visuel)
     'jeunesse_ag':'E8DAEF',          # Planning_Agent : lavande
     'closed':     'EBEBEB',
-    'event_bg':   'FFF3CD', 'agent_txt': '2C3E50',
+    'event_bg':   'EDE7F6', 'agent_txt': '2C3E50',
     'gray':       'AAAAAA', 'alt1':      'FDFEFE', 'alt2':        'EBF5FB',
     'dark':       '2C3E50', 'sp_ok':     'D5F5E3', 'sp_warn':     'FFF3CD',
     'sp_alert':   'FFCCCC', 'sp_ok_t':   '1E8449', 'sp_warn_t':   'E67E22',
@@ -61,6 +64,29 @@ SEC_BG_AG = {'RDC': C['rdc'],    'Adulte': C['adulte'],
              'MF':  C['mf'],     'Jeunesse': C['jeunesse_ag']}
 SEC_HDR = {'RDC': C['hdr_rdc'],  'Adulte': C['hdr_adulte'],
            'MF':  C['hdr_mf'],   'Jeunesse': C['hdr_j']}
+
+# Couleurs de police distinctes par agent (planning semaine)
+AGENT_COLORS = {
+    'Christine':        '000000',
+    'Macha':            '8B0000',
+    'Marie-France':     '006400',
+    'Léa':              'CC5500',
+    'Chloé':            '880E4F',
+    'Anne-Françoise':   '01579B',
+    'Delphine':         '6D4C41',
+    'Stéphane':         '00008B',
+    'Barbara':          '005F73',
+    'Stéphanie':        'AD1457',
+    'Robin':            '8B4513',
+    'Guillaume':        '556B2F',
+    'Tiphaine':         '4B0082',
+    'Agnès':            '1A6B3A',
+    'Vacataire 1':      '6A0DAD',
+    'Vacataire 2':      '5D4E8C',
+}
+
+def agent_color(agent):
+    return AGENT_COLORS.get(agent, '2C3E50')
 
 
 # ── Helpers styles ─────────────────────────────────────────────
@@ -110,19 +136,216 @@ def min_to_dec(m):
 #  ONGLET SEMAINE
 # ══════════════════════════════════════════════════════════════
 
+
+def _cell_text(v):
+    """Extrait le texte d'une cellule pour comparaison (gère CellRichText)."""
+    if v is None:
+        return None
+    try:
+        from openpyxl.cell.rich_text import CellRichText
+        if isinstance(v, CellRichText):
+            return str(v)
+    except Exception:
+        pass
+    return str(v) if v != '' else None
+
+
+def _merge_consecutive_cells(ws, col, row_start, row_end):
+    """Fusionne les cellules consécutives identiques (même contenu textuel) dans une colonne."""
+    if row_start >= row_end:
+        return
+    i = row_start
+    while i <= row_end:
+        val_i = _cell_text(ws.cell(row=i, column=col).value)
+        if val_i is not None:
+            j = i + 1
+            while j <= row_end and _cell_text(ws.cell(row=j, column=col).value) == val_i:
+                j += 1
+            if j > i + 1:
+                src = ws.cell(row=i, column=col)
+                src_fill  = copy(src.fill)
+                src_font  = copy(src.font)
+                src_align = copy(src.alignment)
+                src_bord  = copy(src.border)
+                ws.merge_cells(start_row=i, start_column=col,
+                               end_row=j-1, end_column=col)
+                mc = ws.cell(row=i, column=col)
+                mc.fill      = src_fill
+                mc.font      = src_font
+                mc.alignment = Alignment(horizontal=src_align.horizontal,
+                                         vertical='center', wrap_text=True)
+                mc.border    = src_bord
+            i = j
+        else:
+            i += 1
+
+
+def _merge_consecutive_agent_cells(ws, col, row_start, row_end):
+    """Fusionne les cellules consécutives dans une colonne Planning_Agent :
+    - Même valeur non-vide (congé, événement, SP section)
+    - OU valeur vide/None avec même patternType de remplissage (bureau, off/hachures)
+    """
+    if row_start >= row_end:
+        return
+
+    def _cell_key(r):
+        c = ws.cell(row=r, column=col)
+        v = c.value
+        v_str = _cell_text(v)
+        if v_str is not None:
+            return ('val', v_str)
+        # Cellule vide : clé = type de remplissage
+        pt = c.fill.patternType if c.fill else None
+        fg = ''
+        try:
+            fg = c.fill.fgColor.rgb if c.fill and c.fill.fgColor else ''
+        except Exception:
+            pass
+        return ('empty', pt, fg)
+
+    i = row_start
+    while i <= row_end:
+        key_i = _cell_key(i)
+        j = i + 1
+        while j <= row_end and _cell_key(j) == key_i:
+            j += 1
+        if j > i + 1:
+            src = ws.cell(row=i, column=col)
+            src_fill  = copy(src.fill)
+            src_font  = copy(src.font)
+            src_align = copy(src.alignment)
+            src_bord  = copy(src.border)
+            ws.merge_cells(start_row=i, start_column=col,
+                           end_row=j-1, end_column=col)
+            mc = ws.cell(row=i, column=col)
+            mc.fill      = src_fill
+            mc.font      = src_font
+            mc.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            mc.border    = src_bord
+        i = j
+
 # ── Catégorisation des événements en colonnes G/H/I/J ──────────────────────
 # G = accueil public (classes, assistantes maternelles...)
 # H = animations/événements (café, conférence, stage, bébé se livre, etc.)
 # I = réunions/RDV internes (réunion, RMH, RDV RH, brainstorming...)
 # J = absences (congé, RTT, formation, absence...)
 _EV_KEYWORDS = {
-    'G': ['accueil', 'assistante', 'caj', 'cml'],
+    'G': ['accueil', 'assistante'],
     'H': ['café', 'club', 'conférence', 'conference', 'stage', 'bébé', 'bebe',
-          'forum', 'hors les murs', 'sellier', 'saison', 'défi',
-          'tournée', 'diplôme', 'éloquence', 'eloquence', 'atelier', 'animation'],
+          'caj', 'cml', 'rmh', 'forum', 'hors les murs', 'sellier', 'saison', 'défi',
+          'tournée', 'diplôme', 'éloquence', 'eloquence', 'atelier', 'animation',
+          'visite'],
     'I': ['réunion', 'reunion', 'rdv', 'rmh', 'brainstorm', 'pôle', 'pole'],
     'J': ['congé', 'conge', 'rtt', 'vacation', 'absence', 'formation'],
 }
+
+def _ev_txt_color():
+    """Couleur de texte pour les événements sur fond violet."""
+    return '4A148C'
+
+
+def _rich_agents(agents, cren_range=None, oos=False):
+    """
+    CellRichText : agents colorés + créneau gris optionnel en dessous.
+    cren_range est ajouté après fusion (ex: '10:00-12:00').
+    """
+    parts = []
+    sep_font = InlineFont(color='AAAAAA', b=False, sz=9)
+    cren_font = InlineFont(color='AAAAAA', b=False, sz=8)
+
+    for i, agent in enumerate(agents):
+        if i > 0:
+            parts.append(TextBlock(sep_font, '  /  '))
+        color = 'FFFFFF' if oos else agent_color(agent)
+        af = InlineFont(color=color, b=True, sz=10)
+        parts.append(TextBlock(af, agent))
+
+    if cren_range:
+        parts.append(TextBlock(cren_font, f'\n{cren_range}'))
+
+    return CellRichText(*parts) if parts else None
+
+
+def _add_cren_to_rich(cell, cren_range):
+    """Ajoute le créneau gris à une cellule CellRichText existante (post-merge)."""
+    v = cell.value
+    if v is None:
+        return
+    cren_font = InlineFont(color='AAAAAA', b=False, sz=8)
+    try:
+        from openpyxl.cell.rich_text import CellRichText, TextBlock
+        if isinstance(v, CellRichText):
+            # Supprimer un éventuel créneau déjà présent (commence par \n)
+            parts = [b for b in v if not (hasattr(b, 'text') and str(b.text).startswith('\n'))]
+            parts.append(TextBlock(cren_font, f'\n{cren_range}'))
+            cell.value = CellRichText(*parts)
+        else:
+            # Texte simple
+            txt = str(v).split('\n')[0]
+            cell.value = f'{txt}\n{cren_range}'
+    except Exception:
+        pass
+
+
+def _merge_and_time(ws, col, row_start, row_end, row_cren_map):
+    """
+    Fusionne les cellules consécutives de même contenu agents dans une colonne.
+    Après fusion, ajoute le créneau fusionné (ex: '10:00-12:00') en gris.
+    row_cren_map : {row_number: (cren_name, cs, ce)} — construit pendant l'écriture.
+    Les cellules '—' (vides) sont fusionnées sans ajout de créneau.
+    """
+    if row_start >= row_end:
+        return
+
+    i = row_start
+    while i <= row_end:
+        val_i = _cell_text(ws.cell(row=i, column=col).value)
+        if val_i is not None:
+            j = i + 1
+            while j <= row_end and _cell_text(ws.cell(row=j, column=col).value) == val_i:
+                j += 1
+
+            # Créneau fusionné — seulement si cellule contient un agent (pas '—')
+            cren_range = None
+            if val_i.strip() not in ('—', ''):
+                cs_list = [row_cren_map[r][1] for r in range(i, j) if r in row_cren_map]
+                ce_list = [row_cren_map[r][2] for r in range(i, j) if r in row_cren_map]
+                if cs_list and ce_list:
+                    cs_min, ce_max = min(cs_list), max(ce_list)
+                    cren_range = (f"{cs_min//60:02d}:{cs_min%60:02d}"
+                                  f"-{ce_max//60:02d}:{ce_max%60:02d}")
+
+            if j > i + 1:
+                src = ws.cell(row=i, column=col)
+                src_fill  = copy(src.fill)
+                src_font  = copy(src.font)
+                src_align = copy(src.alignment)
+                src_bord  = copy(src.border)
+                ws.merge_cells(start_row=i, start_column=col,
+                               end_row=j-1, end_column=col)
+                mc = ws.cell(row=i, column=col)
+                mc.fill      = src_fill
+                mc.font      = src_font
+                mc.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                mc.border    = src_bord
+                if cren_range:
+                    _add_cren_to_rich(mc, cren_range)
+            else:
+                if cren_range:
+                    _add_cren_to_rich(ws.cell(row=i, column=col), cren_range)
+            i = j
+        else:
+            i += 1
+
+
+def _set_rich(cell, rich_val, bg, brd=None):
+    """Set une cellule avec CellRichText + fond + alignement."""
+    cell.value = rich_val
+    cell.fill = _fill(bg)
+    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    if brd:
+        cell.border = brd
+
 
 def _ev_categorie(nom):
     """Retourne la colonne (G/H/I/J) d'un événement selon son nom."""
@@ -132,17 +355,24 @@ def _ev_categorie(nom):
             return col
     return 'H'  # par défaut : animation
 
-def _format_ev(ev):
-    """Formate un événement : nom (agents)."""
-    return f"{ev['nom']} ({', '.join(ev['agents'])})"
+def _format_ev(ev, cs=None, ce=None):
+    """Formate un événement avec horaire exact si non aligné sur le créneau.
+    Ne montre pas l'horaire pour les événements journée entière (9h-19h)."""
+    time_suffix = ''
+    FULL_DAY_START, FULL_DAY_END = 540, 1140  # 9h-19h
+    is_full_day = (ev['debut'] <= FULL_DAY_START and ev['fin'] >= FULL_DAY_END)
+    if not is_full_day and cs is not None and ce is not None:
+        if ev['debut'] != cs or ev['fin'] != ce:
+            h1 = f"{ev['debut']//60}h{ev['debut']%60:02d}" if ev['debut']%60 else f"{ev['debut']//60}h"
+            h2 = f"{ev['fin']//60}h{ev['fin']%60:02d}"    if ev['fin']%60   else f"{ev['fin']//60}h"
+            time_suffix = f" [{h1}-{h2}]"
+    return f"{ev['nom']}{time_suffix} ({', '.join(ev['agents'])})"
 
-def _dispatch_events(events):
-    """Répartit une liste d'événements dans les colonnes G/H/I/J.
-    Si plusieurs événements de même catégorie : regroupés dans la même cellule (\n).
-    Retourne {col: texte | None}"""
+def _dispatch_events(events, cs=None, ce=None):
+    """Répartit les événements dans G/H/I/J avec horaire exact si non aligné."""
     buckets = {'G': [], 'H': [], 'I': [], 'J': []}
     for ev in events:
-        buckets[_ev_categorie(ev['nom'])].append(_format_ev(ev))
+        buckets[_ev_categorie(ev['nom'])].append(_format_ev(ev, cs, ce))
     return {col: '\n'.join(lines) if lines else None
             for col, lines in buckets.items()}
 
@@ -187,8 +417,8 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
         wb.remove(wb[sname])
     ws = wb.create_sheet(sname)
     ws.sheet_view.showGridLines = False
-
-    for col, w in {'A':5,'B':14,'C':20,'D':20,'E':20,'F':26,'G':20,'H':20,'I':20,'J':26,'K':30}.items():
+    ws.freeze_panes = 'B1'  # Fige la colonne A (Créneau) pour navigation horizontale
+    for col, w in {'A':14,'B':20,'C':20,'D':20,'E':26,'F':20,'G':22,'H':22,'I':26}.items():
         ws.column_dimensions[col].width = w
 
     # Mapping jour → (row_cren_start, row_cren_end) dans cet onglet
@@ -196,14 +426,14 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
     jour_cren_rows = {}
 
     row = 1
-    ws.merge_cells(f'A{row}:K{row}')
+    ws.merge_cells(f'A{row}:I{row}')
     _set(ws.cell(row=row, column=1,
                  value=f"PLANNING SERVICE PUBLIC — Semaine {week_num}  |  {date_range}  |  {sem_type}"),
          bg=C['hdr_dark'], fnt=_font(bold=True, size=13, color='FFFFFF'), aln=_aln('center'))
     ws.row_dimensions[row].height = 30
     row += 1
 
-    ws.merge_cells(f'A{row}:K{row}')
+    ws.merge_cells(f'A{row}:I{row}')
     _set(ws.cell(row=row, column=1,
                  value="  RDC     Adulte     Musique & Films     Jeunesse     "
                        "Fermé     Événement     ALERTE     Rouge=hors section"),
@@ -226,19 +456,35 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
                    else C['hdr_bleu']  if (is_sam and samedi_type == 'BLEU')
                    else C['hdr_dark'])
 
-        ws.merge_cells(f'A{row}:K{row}')
+        ws.merge_cells(f'A{row}:I{row}')
         _set(ws.cell(row=row, column=1, value=j_label),
              bg=j_color, fnt=_font(bold=True, size=12, color='FFFFFF'), aln=_aln('left'))
         ws.row_dimensions[row].height = 26
         row += 1
 
-        hdrs = [('N°',C['dark']),('Créneau',C['dark']),('RDC',SEC_HDR['RDC']),
+        # ── Jour férié ──────────────────────────────────────────
+        if jour_plan.get('_ferie'):
+            ws.merge_cells(f'A{row}:I{row}')
+            _set(ws.cell(row=row, column=1, value='🎉  JOUR FÉRIÉ  —  Médiathèque fermée'),
+                 bg='F4ECF7', fnt=_font(bold=True, size=11, color='6C3483'),
+                 aln=_aln('center'))
+            ws.row_dimensions[row].height = 28
+            row += 1
+            jour_cren_rows[jour] = (row, row - 1)  # plage vide
+            for ci in range(1, 10):
+                ws.cell(row=row, column=ci).fill = _fill('F0F3F4')
+            ws.row_dimensions[row].height = 4
+            row += 1
+            continue
+
+        # Colonnes : A=Créneau, B=RDC, C=Adulte, D=MF, E=Jeunesse, F=Accueil, G=Animation, H=Réunion, I=Absence
+        hdrs = [('Créneau',C['dark']),('RDC',SEC_HDR['RDC']),
                 ('Adulte',SEC_HDR['Adulte']),('M & F',SEC_HDR['MF']),
                 ('Jeunesse',SEC_HDR['Jeunesse']),('Accueil',C['hdr_purple']),
                 ('Animation',C['hdr_purple']),('Réunion',C['hdr_purple']),
-                ('Absence',C['hdr_purple']),('Alertes',C['hdr_rouge'])]
-        for ci,(h_txt,hc) in enumerate(hdrs):
-            _set(ws.cell(row=row, column=ci+1, value=h_txt),
+                ('Absence',C['hdr_purple'])]
+        for ci,(h_txt,hc) in enumerate(hdrs, 1):
+            _set(ws.cell(row=row, column=ci, value=h_txt),
                  bg=hc, fnt=_font(bold=True, size=10, color='FFFFFF'),
                  aln=_aln('center'), brd=_brd())
         ws.row_dimensions[row].height = 20
@@ -246,33 +492,31 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
 
         # Mémoriser la première ligne de créneaux pour ce jour
         _cren_start_row = row
+        row_cren_map = {}   # {row_number: (cren_name, cs, ce)}
 
         for ni,(cren_name,cs,ce) in enumerate(creneaux):
+            row_cren_map[row] = (cren_name, cs, ce)   # ← enregistrement avant écriture
             slot = jour_plan.get(cren_name)
             if slot is None:
                 # Événements pendant ce créneau fermé (réunions, formations hors ouverture)
                 date_str_closed = date.strftime('%Y-%m-%d')
                 ev_closed = [ev for ev in evenements.get(date_str_closed, [])
                              if ev['debut'] < ce and ev['fin'] > cs]
-                # ev_txt_closed plus utilisé (3 colonnes directes)
-                # Colonnes fixes A-F (fermées)
-                for ci, val in enumerate([ni+1, cren_name,'—','—','—','—'],1):
+                # Colonnes fermées A-E (Créneau + 4 sections)
+                for ci, val in enumerate([cren_name,'—','—','—','—'], 1):
                     _set(ws.cell(row=row, column=ci, value=val or None),
                          bg=C['closed'],
-                         fnt=_font(size=9 if ci>2 else 10, color=C['gray'], italic=ci>1),
+                         fnt=_font(size=10 if ci==1 else 9, color=C['gray'], italic=ci>1),
                          aln=_aln(), brd=_brd())
-                # 4 colonnes événement catégorisées G-J
-                ev_buckets_c = _dispatch_events(ev_closed)
+                # 4 colonnes événement F-I
+                ev_buckets_c = _dispatch_events(ev_closed, cs=cs, ce=ce)
                 for ev_col_i, col_key in enumerate(['G','H','I','J']):
                     ev_val = ev_buckets_c[col_key]
-                    _set(ws.cell(row=row, column=7+ev_col_i, value=ev_val),
+                    _set(ws.cell(row=row, column=6+ev_col_i, value=ev_val),
                          bg=C['event_bg'] if ev_val else C['closed'],
                          fnt=_font(size=9, italic=True,
-                                   color='6E2F09' if ev_val else C['gray']),
+                                   color=_ev_txt_color() if ev_val else C['gray']),
                          aln=_aln('left'), brd=_brd())
-                # K = alertes (vide pour créneaux fermés)
-                _set(ws.cell(row=row, column=11, value=None),
-                     bg=C['closed'], fnt=_font(size=9), aln=_aln(), brd=_brd())
                 if ev_closed:
                     max_lines = max((len(v.split('\n')) for v in ev_buckets_c.values() if v), default=1)
                     ws.row_dimensions[row].height = max(20, 16*max_lines)
@@ -282,76 +526,81 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
                 alerts = slot.get('alerts', [])
                 oos    = slot.get('out_of_section', {})
 
-                _set(ws.cell(row=row, column=1, value=ni+1),
-                     bg='F2F3F4', fnt=_font(size=9, color='7F8C8D'), aln=_aln(), brd=_brd())
-                _set(ws.cell(row=row, column=2, value=cren_name),
+                # Col A = créneau
+                _set(ws.cell(row=row, column=1, value=cren_name),
                      bg='FDFEFE', fnt=_font(bold=True, size=10), aln=_aln(), brd=_brd())
 
                 for si, sect in enumerate(SECTIONS):
-                    col = si + 3
+                    col = si + 2   # B=2 RDC, C=3 Adulte, D=4 MF, E=5 Jeunesse
                     agents  = assgn.get(sect, [])
                     has_al  = any(sect in al for al in alerts)
                     is_oos  = oos.get(sect, False)
 
                     if is_oos and agents:
-                        val = '⚠ ' + '  /  '.join(agents)
-                        bg  = C['oos_bg']
-                        fc  = C['oos_txt']
+                        rich = _rich_agents(agents, oos=True)  # créneau ajouté post-merge
+                        cell = ws.cell(row=row, column=col)
+                        _set_rich(cell, rich, C['oos_bg'], _brd())
                     elif agents:
-                        val = '  /  '.join(agents)
-                        bg  = SEC_BG[sect]
-                        fc  = C['vac_txt'] if all(is_vacataire(a) for a in agents) else C['agent_txt']
+                        bg   = SEC_BG[sect]
+                        rich = _rich_agents(agents)            # créneau ajouté post-merge
+                        cell = ws.cell(row=row, column=col)
+                        _set_rich(cell, rich, bg, _brd())
                     elif has_al:
-                        val, bg, fc = 'ALERTE', C['conge_bg'], C['sp_alert_t']
+                        _set(ws.cell(row=row, column=col, value='ALERTE'),
+                             bg=C['conge_bg'],
+                             fnt=_font(size=10, color=C['sp_alert_t'], bold=True),
+                             aln=_aln('center'), brd=_brd())
                     else:
-                        val, bg, fc = '—', 'FDF2F8', 'C0392B'
+                        _set(ws.cell(row=row, column=col, value='—'),
+                             bg='FDF2F8',
+                             fnt=_font(size=10, color='C0392B'),
+                             aln=_aln('center'), brd=_brd())
 
-                    _set(ws.cell(row=row, column=col, value=val),
-                         bg=bg, fnt=_font(size=10, color=fc, bold=bool(agents)),
-                         aln=_aln('center'), brd=_brd())
-
-                # 4 colonnes événement (G=Accueil, H=Animation, I=Réunion, J=Absence)
-                ev_buckets = _dispatch_events(events)
+                # 4 colonnes événement (F=Accueil, G=Animation, H=Réunion, I=Absence)
+                ev_buckets = _dispatch_events(events, cs=cs, ce=ce)
                 for ev_col_i, col_key in enumerate(['G','H','I','J']):
                     ev_val = ev_buckets[col_key]
                     n_lines = len(ev_val.split('\n')) if ev_val else 0
-                    _set(ws.cell(row=row, column=7+ev_col_i, value=ev_val),
+                    _set(ws.cell(row=row, column=6+ev_col_i, value=ev_val),
                          bg=C['event_bg'] if ev_val else 'FAFAFA',
                          fnt=_font(size=9, italic=True,
-                                   color='6E2F09' if ev_val else C['gray']),
+                                   color=_ev_txt_color() if ev_val else C['gray']),
                          aln=_aln('left'), brd=_brd())
 
-                al_txt = '\n'.join(alerts) if alerts else None
-                _set(ws.cell(row=row, column=11, value=al_txt),
-                     bg=C['conge_bg'] if al_txt else 'FAFAFA',
-                     fnt=_font(size=9, bold=bool(al_txt),
-                               color=C['sp_alert_t'] if al_txt else C['gray']),
-                     aln=_aln('left'), brd=_brd())
-
                 max_ev_lines = max((len(v.split('\n')) for v in ev_buckets.values() if v), default=0)
-                h = max(20, 16*max(max_ev_lines, len(alerts), 1))
+                h = max(20, 16*max(max_ev_lines, 1))
                 ws.row_dimensions[row].height = h
             row += 1
 
         # Mémoriser la dernière ligne de créneaux pour ce jour
         jour_cren_rows[jour] = (_cren_start_row, row - 1)
 
-        for ci in range(1, 9):
+        # Fusionner cellules consécutives :
+        # Sections B-E : _merge_and_time
+        # Événements F-I : _merge_consecutive_cells
+        last_cren_row = row - 1
+        if _cren_start_row < last_cren_row:
+            for sect_col in range(2, 6):   # B=2 RDC, C=3 Adulte, D=4 MF, E=5 Jeunesse
+                _merge_and_time(ws, sect_col, _cren_start_row, last_cren_row, row_cren_map)
+            for ev_col in range(6, 10):    # F=6, G=7, H=8, I=9
+                _merge_consecutive_cells(ws, ev_col, _cren_start_row, last_cren_row)
+
+        for ci in range(1, 10):
             ws.cell(row=row, column=ci).fill = _fill('F0F3F4')
         ws.row_dimensions[row].height = 4
         row += 1
-
-    # ── Récap SP ────────────────────────────────────────────────
     row += 1
-    ws.merge_cells(f'A{row}:K{row}')
+    ws.merge_cells(f'A{row}:I{row}')
     _set(ws.cell(row=row, column=1,
                  value="RÉCAP — Heures de Service Public par agent (heures décimales)"),
          bg='34495E', fnt=_font(bold=True, size=11, color='FFFFFF'), aln=_aln('center'))
     ws.row_dimensions[row].height = 24
     row += 1
 
-    hdrs2 = ['Agent','Section','Mardi','Mercredi','Jeudi','Vendredi','Samedi','Total (h)']
-    hcols = ['34495E','34495E','1A5276','1A5276','1A5276','1A5276','922B21','145A32']
+    hdrs2 = ['Agent','Section','Mardi','Mercredi','Jeudi','Vendredi','Samedi',
+              '','','','','Total (h)']
+    hcols = ['34495E','34495E','1A5276','1A5276','1A5276','1A5276','922B21',
+             'AAAAAA','AAAAAA','AAAAAA','AAAAAA','145A32']
     for ci,(h_txt,hc) in enumerate(zip(hdrs2,hcols)):
         _set(ws.cell(row=row, column=ci+1, value=h_txt),
              bg=hc, fnt=_font(bold=True, size=10, color='FFFFFF'),
@@ -417,10 +666,9 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
                 cell.alignment = _aln()
                 cell.border    = _brd()
 
-        # Total — formule SUM des colonnes jour
-        tc = ws.cell(row=row, column=8)
-        # Colonnes C..G (indices 3..7) = 5 jours max
-        # On somme les colonnes qui ont une date
+        # Total — formule SUM des colonnes jour (col L=12, masquable)
+        tc = ws.cell(row=row, column=12)
+        # Colonnes C..G (indices 3..7) = 5 jours max → Total en col L (12)
         sum_cols = [get_column_letter(3 + ji)
                     for ji, jour in enumerate(JOURS_SP)
                     if week_dates.get(jour) is not None]
@@ -456,7 +704,7 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
         row += 1
 
     row += 1
-    ws.merge_cells(f'A{row}:K{row}')
+    ws.merge_cells(f'A{row}:I{row}')
     _set(ws.cell(row=row, column=1,
                  value="Vert=OK  |  Rouge=sous min  |  Orange=sur max  |  "
                        "Violet=vacataire  |  Rouge vif cellule planning=agent hors section"),
@@ -536,9 +784,9 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
     # ── Légende ─────────────────────────────────────────────────
     ws.merge_cells(f'A{row}:{end_col}{row}')
     _set(ws.cell(row=row, column=1,
-                 value="  SP = section (couleur)     Arr. XXhYY = arrivée hors heure ronde     "
-                       "Jaune = au bureau (hors SP)     Gris — = absent / hors horaires     "
-                       "Rose = Congé/RTT     Rouge vif = hors section habituelle"),
+                 value="  SP = section (couleur)     Arr./Fin XXhYY = horaire décalé (gris)     "
+                       "Gris uni = au bureau hors SP     Hachures = hors horaires     "
+                       "Jaune = événement / congé     Rouge vif = hors section habituelle"),
          bg='34495E', fnt=_font(size=9, italic=True, color='FFFFFF'), aln=_aln('left'))
     ws.row_dimensions[row].height = 15
     row += 2
@@ -608,19 +856,21 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
         hdr_fc     = C['vac_txt'] if is_vacataire(agent) else 'FFFFFF'
 
         # ── En-tête agent ───────────────────────────────────────
+        HDR_GREEN = '1A6B3A'
         ws.merge_cells(f'A{row}:{end_col}{row}')
-        sects_label = ' / '.join(sects)
+        sects_label = sects[0] if sects else '?'
         _set(ws.cell(row=row, column=1,
-                     value=f"  {agent.upper()}   ({sects_label})"),
-             bg=hdr_bg, fnt=_font(bold=True, size=11, color=hdr_fc),
+                     value=f"  {agent.upper()}   —   {sects_label}"),
+             bg=HDR_GREEN, fnt=_font(bold=True, size=12, color='FFFFFF'),
              aln=_aln('left'))
         # Colonne H : total heures travaillées sur la semaine
         total_h = total_heures_semaine(agent)
         h_cell = ws.cell(row=row, column=col_h_total)
-        _set(h_cell, value=f"⏱ {total_h}",
-             bg=hdr_bg, fnt=_font(bold=True, size=10, color=hdr_fc),
-             aln=_aln('center'))
-        ws.row_dimensions[row].height = 24
+        h_cell.value = f"⏱ {total_h}"
+        h_cell.fill = _fill(HDR_GREEN)
+        h_cell.font = _font(bold=True, size=10, color='A8E6BE')
+        h_cell.alignment = _aln('center')
+        ws.row_dimensions[row].height = 26
         row += 1
 
         # ── En-tête colonnes ────────────────────────────────────
@@ -647,7 +897,10 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
 
         # ── Lignes d'arrivée (8h30-9h et 9h-10h) ───────────────
         # Même formatage colonne B que les créneaux SP
+        early_start_row = row  # pour la fusion sur la plage complète
+        pa_row_cren_map = {}   # {row: (slot_name, cs, ce)} pour _merge_and_time
         for slot_name, es, ee in EARLY_SLOTS:
+            pa_row_cren_map[row] = (slot_name, es, ee)
             _set(ws.cell(row=row, column=1), bg='F8F9FA')
             ws.cell(row=row, column=1).value = ''
             # Colonne B : même style que les créneaux SP normaux
@@ -660,6 +913,14 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
                 date     = week_dates.get(jour)
                 date_str = date.strftime('%Y-%m-%d')
                 cell     = ws.cell(row=row, column=c)
+
+                # Jour férié → hachures
+                if plan.get(jour, {}).get('_ferie'):
+                    cell.fill = _hatch()
+                    cell.value = None
+                    cell.alignment = _aln()
+                    cell.border = _brd()
+                    continue
 
                 # Vérifier congé sur la journée entière
                 # (congé = événement couvrant le début de journée ou le créneau)
@@ -681,48 +942,47 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
                             and ev['nom'].lower() not in ('congé','conge','rtt','vacation')]
 
                 if is_conge:
-                    # Congé : affiché dès 8h30 si l'agent travaille habituellement
                     _set(cell, value='Congé',
-                         bg=C['conge_bg'],
-                         fnt=_font(size=9, color=C['conge_txt'], italic=True),
+                         bg=C['event_bg'],
+                         fnt=_font(size=9, color=_ev_txt_color(), italic=True),
                          aln=_aln(), brd=_brd())
 
                 elif ev_early:
                     ev_lbl = ev_early[0]['nom'][:20]
                     _set(cell, value=ev_lbl,
                          bg=C['event_bg'],
-                         fnt=_font(size=9, italic=True, color='6E2F09'),
+                         fnt=_font(size=9, italic=True, color=_ev_txt_color()),
                          aln=_aln(), brd=_brd())
 
                 elif sm is not None and es <= sm < ee:
-                    # L'agent arrive pendant ce créneau
-                    # → mention précise SEULEMENT si heure ≠ début exact du créneau
                     if sm == es:
-                        # Arrive pile à l'heure du créneau → cellule bureau (blanc)
                         _set(cell, value='',
-                             bg=C['bureau_bg'],
+                             bg='F0F0F0',
                              fnt=_font(size=8, color=C['gray']),
                              aln=_aln(), brd=_brd())
                     else:
-                        # Arrive en cours de créneau → indiquer l'heure précise
                         _set(cell, value=f"Arr. {min_to_hhmm(sm)}",
-                             bg=C['arrival_bg'],
-                             fnt=_font(size=9, bold=True, color=C['arrival_txt']),
+                             bg='F0F0F0',
+                             fnt=_font(size=9, italic=True, color='555555'),
                              aln=_aln(), brd=_brd())
 
                 elif sm is not None and sm < es:
-                    # Agent déjà arrivé avant ce créneau → au bureau (blanc)
                     _set(cell, value='',
-                         bg=C['bureau_bg'],
+                         bg='F0F0F0',
                          fnt=_font(size=8, color=C['gray']),
                          aln=_aln(), brd=_brd())
+                    cell.border = Border(
+                        left=Side(style='medium', color='AAAAAA'),
+                        right=Side(style='thin', color='CCCCCC'),
+                        top=Side(style='thin', color='CCCCCC'),
+                        bottom=Side(style='thin', color='CCCCCC'))
 
                 else:
-                    # Pas encore arrivé / ne travaille pas ce jour → gris + tiret
-                    _set(cell, value='—',
-                         bg=C['off_bg'],
-                         fnt=_font(size=10, color=C['off_txt']),
-                         aln=_aln(), brd=_brd())
+                    cell.fill = _hatch()
+                    cell.value = None
+                    cell.font = _font(size=10, color=C['off_txt'])
+                    cell.alignment = _aln()
+                    cell.border = _brd()
 
             ws.row_dimensions[row].height = 26
             row += 1
@@ -731,6 +991,7 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
         cren_start_row = row  # première ligne SP (pour la formule)
 
         for cren_idx, (cren_name, cs, ce) in enumerate(creneaux):
+            pa_row_cren_map[row] = (cren_name, cs, ce)  # ← pour _merge_and_time
             # Colonne A : durée en heures décimales (police blanche = invisible)
             # Utilisée par la formule SUMPRODUCT pour éviter les tableaux littéraux
             dur_h = round((ce - cs) / 60, 4)
@@ -749,6 +1010,14 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
                 date_str = date.strftime('%Y-%m-%d')
                 cell     = ws.cell(row=row, column=c)
                 slot     = plan.get(jour, {}).get(cren_name)
+
+                # Jour férié → hachures
+                if plan.get(jour, {}).get('_ferie'):
+                    cell.fill = _hatch()
+                    cell.value = None
+                    cell.alignment = _aln()
+                    cell.border = _brd()
+                    continue
 
                 ev_names = [ev['nom'] for ev in evenements.get(date_str, [])
                             if agent in ev['agents']
@@ -778,116 +1047,54 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
 
                 if is_conge:
                     _set(cell, value='Congé',
-                         bg=C['conge_bg'],
-                         fnt=_font(size=9, color=C['conge_txt'], italic=True),
+                         bg=C['event_bg'],
+                         fnt=_font(size=9, color=_ev_txt_color(), italic=True),
                          aln=_aln(), brd=_brd())
                 elif event:
                     ev_label = event[0][:20]
                     _set(cell, value=ev_label,
                          bg=C['event_bg'],
-                         fnt=_font(size=9, italic=True, color='6E2F09'),
+                         fnt=_font(size=9, italic=True, color=_ev_txt_color()),
                          aln=_aln(), brd=_brd())
                 elif sp_section and is_oos_cell:
-                    # Hors section habituelle → statique (cas rare, pas de formule)
-                    _set(cell, value=f"SP\n{sp_section}\n⚠hors sect.",
+                    sec_label = 'M & F' if sp_section == 'MF' else sp_section
+                    _set(cell, value=f"SP\n{sec_label}\n⚠",
                          bg=C['oos_bg'],
                          fnt=_font(size=8, bold=True, color=C['oos_txt']),
                          aln=_aln(), brd=_brd())
+                elif sp_section:
+                    # Agent en SP — statique, couleur section (créneau ajouté post-merge)
+                    sec_label = 'M & F' if sp_section == 'MF' else sp_section
+                    bg_sp = SEC_BG.get(sp_section, 'FFFFFF')
+                    sp_font = InlineFont(color='1A1A1A', b=True, sz=9)
+                    rich = CellRichText(TextBlock(sp_font, f'SP\n{sec_label}'))
+                    cell.value = rich
+                    cell.fill = _fill(bg_sp)
+                    cell.alignment = _aln()
+                    cell.border = _brd()
                 elif not in_horaires:
-                    # Hors horaires → statique gris + tiret
-                    _set(cell, value='—',
-                         bg=C['off_bg'],
-                         fnt=_font(size=10, color=C['off_txt']),
-                         aln=_aln(), brd=_brd())
+                    # Hors horaires (dont pause méridienne) → hachures
+                    cell.fill = _hatch()
+                    cell.value = None
+                    cell.font = _font(size=10, color=C['off_txt'])
+                    cell.alignment = _aln()
+                    cell.border = _brd()
                 else:
-                    # SP ou bureau → formule dynamique si jour_cren_rows dispo
-                    # =IF(SUMPRODUCT(ISNUMBER(SEARCH("Agent",'Sem'!C{r}:F{r})))>0,"SP","")
-                    sem_row = None
-                    if jour_cren_rows and jour in jour_cren_rows:
-                        r1_sem, _ = jour_cren_rows[jour]
-                        sem_row   = r1_sem + cren_idx   # ligne exacte dans Semaine_N
-                    if sem_row is not None:
-                        sem_sht = 'Semaine_' + str(week_num)
-                        ag = agent.replace('"', '""')
-                        # IF imbrique: cherche agent col C(RDC) D(Adulte) E(MF) F(Jeunesse)
-                        # CHAR(10) = saut de ligne (EN); Excel FR accepte les deux
-                        p1 = 'ISNUMBER(SEARCH("' + ag + '",\'' + sem_sht + '\'!C' + str(sem_row) + '))'
-                        p2 = 'ISNUMBER(SEARCH("' + ag + '",\'' + sem_sht + '\'!D' + str(sem_row) + '))'
-                        p3 = 'ISNUMBER(SEARCH("' + ag + '",\'' + sem_sht + '\'!E' + str(sem_row) + '))'
-                        p4 = 'ISNUMBER(SEARCH("' + ag + '",\'' + sem_sht + '\'!F' + str(sem_row) + '))'
-                        formula = (
-                            '=IF(' + p1 + ',"SP"&CHAR(10)&"RDC",'
-                            'IF(' + p2 + ',"SP"&CHAR(10)&"Adulte",'
-                            'IF(' + p3 + ',"SP"&CHAR(10)&"M & F",'
-                            'IF(' + p4 + ',"SP"&CHAR(10)&"Jeunesse",""))))'
-                        )
-                        cell.value     = formula
-                        cell.alignment = _aln()
-                        cell.border    = _brd()
-                        # Couleur initiale selon section (même palette que planning semaine)
-                        if sp_section:
-                            sect_color = SEC_BG.get(sp_section, C['sp_dyn_bg'])
-                            cell.fill = _fill(sect_color)
-                            cell.font = _font(size=9, bold=True, color=C['agent_txt'])
-                        else:
-                            cell.fill = _fill(C['bureau_bg'])
-                            cell.font = _font(size=8, color=C['bureau_txt'])
-                    else:
-                        # Fallback statique
-                        if sp_section:
-                            bg_sp = (C['vac_bg'] if is_vacataire(agent)
-                                     else SEC_BG.get(sp_section, C['sp_dyn_bg']))
-                            fc_sp = C['vac_txt'] if is_vacataire(agent) else C['agent_txt']
-                            _set(cell, value=f"SP\n{sp_section}",
-                                 bg=bg_sp, fnt=_font(size=9, bold=True, color=fc_sp),
-                                 aln=_aln(), brd=_brd())
-                        else:
-                            _set(cell, value='',
-                                 bg=C['bureau_bg'],
-                                 fnt=_font(size=8, color=C['gray']),
-                                 aln=_aln(), brd=_brd())
+                    # Au bureau, pas de SP, pas d'événement → gris sobre
+                    cell.value = None
+                    cell.fill = _fill('F0F0F0')
+                    cell.font = _font(size=8, color=C['gray'])
+                    cell.alignment = _aln()
+                    cell.border = Border(
+                        left=Side(style='medium', color='AAAAAA'),
+                        right=Side(style='thin', color='DDDDDD'),
+                        top=Side(style='thin', color='DDDDDD'),
+                        bottom=Side(style='thin', color='DDDDDD'))
 
             ws.row_dimensions[row].height = 28
             row += 1
 
         cren_end_row = row - 1  # dernière ligne SP (inclusive)
-
-        # ── Mise en forme conditionnelle sur la plage créneaux ───────
-        # Appliquée sur toutes les colonnes jour × toutes les lignes créneaux
-        # Règle 1 : cellule = "SP"  → lavande (fond SP)
-        # Règle 2 : cellule = ""    → jaune (bureau)
-        # Les cellules statiques (—, Congé, Évén.) ne matchent aucune règle
-        if jours_presents and jour_cren_rows:
-            col_start = col_map[jours_presents[0]]
-            col_end   = col_map[jours_presents[-1]]
-            cf_range  = (f"{get_column_letter(col_start)}{cren_start_row}:"
-                         f"{get_column_letter(col_end)}{cren_end_row}")
-
-            anc = f"{get_column_letter(col_start)}{cren_start_row}"
-            font_sp  = Font(size=9, bold=True)
-            font_bur = Font(size=8, color='6A1B9A')
-
-            # Mise en forme conditionnelle : mêmes couleurs que planning semaine
-            sect_rules = [
-                ('RDC',      SEC_BG['RDC'],      'ISNUMBER(SEARCH("RDC",' + anc + '))'),
-                ('Adulte',   SEC_BG['Adulte'],   'ISNUMBER(SEARCH("Adulte",' + anc + '))'),
-                ('M & F',    SEC_BG['MF'],       'ISNUMBER(SEARCH("M & F",' + anc + '))'),
-                ('Jeunesse', SEC_BG['Jeunesse'], 'ISNUMBER(SEARCH("Jeunesse",' + anc + '))'),
-            ]
-            for _, color, formula in sect_rules:
-                ws.conditional_formatting.add(cf_range, FormulaRule(
-                    formula=[formula],
-                    fill=PatternFill(fill_type='solid', fgColor=color),
-                    font=font_sp,
-                    stopIfTrue=True
-                ))
-            # Bureau (présent hors SP) = violet doux
-            ws.conditional_formatting.add(cf_range, FormulaRule(
-                formula=[f'{anc}=""'],
-                fill=PatternFill(fill_type='solid', fgColor=C['bureau_bg']),
-                font=font_bur,
-                stopIfTrue=True
-            ))
 
         # ── Créneau tardif (après 19h) ──────────────────────────
         late_name, ls, le = LATE_SLOT
@@ -921,36 +1128,32 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
                     ev_lbl = ev_late_agent[0]['nom'][:20]
                     _set(cell, value=ev_lbl,
                          bg=C['event_bg'],
-                         fnt=_font(size=9, italic=True, color='6E2F09'),
+                         fnt=_font(size=9, italic=True, color=_ev_txt_color()),
                          aln=_aln(), brd=_brd())
                 elif ea is not None and ea > 1140:
-                    # Finit après 19h → indiquer l'heure précise
                     _set(cell, value=f"Fin {min_to_hhmm(ea)}",
-                         bg=C['arrival_bg'],
-                         fnt=_font(size=9, bold=True, color=C['arrival_txt']),
+                         bg='F0F0F0',
+                         fnt=_font(size=9, italic=True, color='555555'),
                          aln=_aln(), brd=_brd())
                 elif ea is not None and ea == 1140:
-                    # Finit pile à 19h → bureau vide
                     _set(cell, value='',
-                         bg=C['bureau_bg'],
+                         bg='F0F0F0',
                          fnt=_font(size=8, color=C['gray']),
                          aln=_aln(), brd=_brd())
                 else:
-                    # Ne travaille pas / finit avant → gris
-                    _set(cell, value='—',
-                         bg=C['off_bg'],
-                         fnt=_font(size=10, color=C['off_txt']),
-                         aln=_aln(), brd=_brd())
+                    cell.fill = _hatch()
+                    cell.value = None
+                    cell.font = _font(size=10, color=C['off_txt'])
+                    cell.alignment = _aln()
+                    cell.border = _brd()
             ws.row_dimensions[row].height = 26
             row += 1
 
-        # ── Ligne TOTAL SP (formule SUMPRODUCT dynamique) ──────
-        # Les cellules SP seront converties en sharedStrings en post-processing
-        # → SEARCH("SP", ...) fonctionnera nativement dans Excel
-        _set(ws.cell(row=row, column=1), bg='F0F3F4')
+        # ── Ligne TOTAL SP ──────────────────────────────────────
+        _set(ws.cell(row=row, column=1), bg='1A6B3A')
         ws.cell(row=row, column=1).value = ''
         _set(ws.cell(row=row, column=2, value='TOTAL SP'),
-             bg='34495E', fnt=_font(bold=True, size=9, color='FFFFFF'),
+             bg='1A6B3A', fnt=_font(bold=True, size=10, color='FFFFFF'),
              aln=_aln(), brd=_brd())
 
         agent_sp_cells[agent] = {}
@@ -961,8 +1164,8 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
         # Entièrement recalculé par Excel si Semaine_N est modifié
 
         sem_sheet = f"Semaine_{week_num}"   # nom de l'onglet source
-        # Sections = colonnes C,D,E,F dans Semaine_N
-        SEC_COLS_SEM = ['C', 'D', 'E', 'F']
+        # Sections = colonnes B,C,D,E dans Semaine_N (après suppression col A N°)
+        SEC_COLS_SEM = ['B', 'C', 'D', 'E']
 
         for jour in jours_presents:
             c          = col_map[jour]
@@ -1005,10 +1208,10 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
                 total_cell.value         = formula
                 total_cell.number_format = '0.00'
 
-                bg_t = 'D5F5E3' if sp_j > 0 else 'F0F3F4'
-                fc_t = '1E8449' if sp_j > 0 else C['gray']
+                bg_t = '155C30' if sp_j > 0 else '1A6B3A'
+                fc_t = 'A8E6BE' if sp_j > 0 else '7FC89A'
                 total_cell.fill      = _fill(bg_t)
-                total_cell.font      = _font(bold=sp_j > 0, size=9, color=fc_t)
+                total_cell.font      = _font(bold=sp_j > 0, size=10, color=fc_t)
                 total_cell.alignment = _aln()
                 total_cell.border    = _brd()
 
@@ -1016,12 +1219,20 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
                 agent_sp_cells[agent][jour] = f"{col_ltr}{row}"
             else:
                 _set(total_cell, value='—',
-                     bg='F0F3F4',
-                     fnt=_font(size=9, color=C['gray']),
+                     bg='1A6B3A',
+                     fnt=_font(size=9, color='7FC89A'),
                      aln=_aln(), brd=_brd())
 
-        ws.row_dimensions[row].height = 20
+        ws.row_dimensions[row].height = 24
         row += 1
+
+        # ── Fusion cellules consécutives par colonne jour ──────
+        # Couvre EARLY slots + SP créneaux + LATE slot
+        # Fusion par colonne jour avec ajout du créneau fusionné
+        if early_start_row < cren_end_row:
+            for jour in jours_presents:
+                col_j = col_map[jour]
+                _merge_and_time(ws, col_j, early_start_row, cren_end_row, pa_row_cren_map)
 
         # ── Séparateur ──────────────────────────────────────────
         for ci in range(1, nb_cols + 1):
@@ -1296,8 +1507,8 @@ def _patch_recap_formulas(wb, week_data, metadata, agent_sp_cells):
                 cell.border    = _brd()
             # Jours absents : laisser tel quel (déjà '—')
 
-        # Colonne H : SUM dynamique des colonnes jour présents
-        tc = ws.cell(row=r, column=8)
+        # Colonne L : SUM dynamique (col 12, masquable entre jours et total)
+        tc = ws.cell(row=r, column=12)
         sum_cols = [get_column_letter(3 + ji)
                     for ji, jour in enumerate(JOURS_SP)
                     if week_dates.get(jour) is not None]
