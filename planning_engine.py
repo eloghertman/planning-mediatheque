@@ -76,8 +76,9 @@ BLOCS_CONTINU = [
     (1020, 1140), # 17h-19h
 ]
 JOURS_CONTINU = {'Mercredi', 'Samedi'}
-# F : agents pouvant travailler en continu 10h-14h sans pause méridienne
-AGENTS_EXCEPTION_MERIDIENNE = {'lydie', 'delphine'}
+# F : agents pouvant travailler sans pause méridienne obligatoire
+# Peuplé dynamiquement depuis la colonne Pause_flexible de l'onglet Affectations
+AGENTS_EXCEPTION_MERIDIENNE = set()
 
 def get_bloc_id(jour, cs):
     """Retourne l'identifiant du bloc horaire (int) pour ce jour/heure début."""
@@ -120,12 +121,43 @@ def is_vacataire(agent):
     return 'vacataire' in str(agent).lower()
 
 def normalize_agent_name(name):
-    """Normalise les noms d'agents (ex: Vacataire2 → Vacataire 2)."""
+    """Normalise les noms d'agents.
+    - Vacataire2 → Vacataire 2
+    - Marie France / MarieFrance → Marie-France
+    - Anne Françoise / Anne Francoise → Anne-Françoise
+    - Stephanie → Stéphanie, Stephane → Stéphane, etc.
+    - Annne-Françoise (typo) → Anne-Françoise
+    """
     if not name or str(name).strip() in ('nan', ''):
         return None
     n = str(name).strip()
     import re
-    n = re.sub(r'(?i)vacataire(\d)', r'Vacataire \1', n)
+    n = re.sub(r'(?i)vacataire\s*(\d)', r'Vacataire \1', n)
+    # Corrections de typographie connues
+    _FIXES = {
+        'marie france':        'Marie-France',
+        'marie-france':        'Marie-France',
+        'anne françoise':      'Anne-Françoise',
+        'anne francoise':      'Anne-Françoise',
+        'anne-françoise':      'Anne-Françoise',
+        'anne-francoise':      'Anne-Françoise',
+        'annne-françoise':     'Anne-Françoise',   # typo 3 n
+        'annne françoise':     'Anne-Françoise',
+        'stephanie':           'Stéphanie',
+        'stephane':            'Stéphane',
+        'stéphanie':           'Stéphanie',
+        'stéphane':            'Stéphane',
+        'léa,':               'Léa',              # virgule parasite
+    }
+    key = n.lower().strip().rstrip(',')
+    # Essai exact après strip virgule
+    n_clean = re.sub(r',\s*$', '', n).strip()
+    if n_clean.lower() in _FIXES:
+        return _FIXES[n_clean.lower()]
+    if key in _FIXES:
+        return _FIXES[key]
+    # Retirer virgules parasites en fin
+    n = re.sub(r',\s*$', '', n).strip()
     return n
 
 def parse_date_flexible(val, annee):
@@ -239,17 +271,19 @@ def parse_horaires_ouverture(data):
 
 def parse_affectations(data):
     """
-    Retourne (affectations, categories, responsables) :
-      affectations : {agent: [section1, section2, ...]}  (ordre = priorité)
-      categories   : {agent: str|None}  (A, B, C, C2, ou None pour vacataires)
-      responsables : set of agent names having 'OUI' in the Responsable column
+    Retourne (affectations, categories, responsables, pause_flexible) :
+      affectations   : {agent: [section1, section2, ...]}  (ordre = priorité)
+      categories     : {agent: str|None}  (A ou None)
+      responsables   : set of agent names having 'OUI' in the Responsable column
+      pause_flexible : set of agent names having 'OUI' in the Pause_flexible column
 
-    Format Excel : Agent | Catégorie | Section1..4 | Responsable
+    Format Excel : Agent | Catégorie | Section1..4 | Responsable | Pause_flexible
     """
     df = data['Affectations']
     result = {}
     categories = {}
     responsables = set()
+    pause_flexible = set()
 
     # Détecter la présence de la colonne Catégorie
     has_cat = False
@@ -275,45 +309,41 @@ def parse_affectations(data):
             categories[agent] = v if v not in ('nan', '') else None
         else:
             categories[agent] = None
-        # Sections (ignorer colonnes de notes et colonne Responsable)
+        # Sections + colonnes spéciales (Responsable, Pause_flexible)
         sections = []
+        oui_count = 0  # compter les OUI rencontrés (1er = Responsable, 2e = Pause_flexible)
         for i in range(sect_start, len(row)):
             v = str(row.iloc[i]).strip() if pd.notna(row.iloc[i]) else ''
             if not v or v in ('nan',):
                 continue
-            # Colonne Responsable : valeur OUI → marquer l'agent, ne pas ajouter comme section
             if v.upper() == 'OUI':
-                responsables.add(agent)
+                oui_count += 1
+                if oui_count == 1:
+                    responsables.add(agent)
+                elif oui_count == 2:
+                    pause_flexible.add(agent)
                 continue
             if len(v) <= 20 and ':' not in v and '→' not in v:
                 sections.append(v)
         if sections:
             result[agent] = sections
-    return result, categories, responsables
+    return result, categories, responsables, pause_flexible
 
 
 def get_sections_sans_alerte(agent, affectations, categories):
     """
-    Sections où l'agent peut aller sans alerte rouge, selon sa catégorie :
-      A  → section primaire uniquement (Jeunesse)
-      B  → section primaire uniquement (MF)
-      C  → Adulte + RDC (équivalents)
-      C2 → section primaire uniquement (Adulte)
-      None (vacataires) → toutes leurs sections sauf RDC
+    Sections où l'agent peut aller sans alerte rouge :
+      Catégorie A  → sections 1 ET 2 interchangeables (sects[:2])
+      Vacataires   → toutes leurs sections sauf RDC
+      Autres (None)→ section 1 uniquement (sects[:1])
     """
-    cat = categories.get(agent)
+    cat   = categories.get(agent)
     sects = affectations.get(agent, [])
-    if cat == 'A':
-        return sects[:1]
-    elif cat == 'B':
-        return sects[:1]
-    elif cat == 'C':
-        return [s for s in sects if s in ('Adulte', 'RDC')]
-    elif cat == 'C2':
-        return [sects[0]] if sects else []
-    else:
-        # Vacataires : toutes sections sauf RDC
+    if is_vacataire(agent):
         return [s for s in sects if s != 'RDC']
+    if cat == 'A':
+        return sects[:2]
+    return sects[:1]
 
 
 def is_section_rouge(agent, section, affectations, categories):
@@ -469,48 +499,161 @@ def parse_sp_minmax(data):
             result[i] = dict(fallback)
     return result
 
+def parse_pt_hours(data):
+    """
+    Lit le tableau récapitulatif des heures SP par agent depuis l'onglet planning_type.
+    Format : Agent | heures_MarVen | heures_MarSam
+    Retourne dict: {agent: {'MarVen': float, 'MarSam': float}}
+    """
+    df = data['planning_type']
+    result = {}
+    in_table = False
+    for _, row in df.iterrows():
+        c0 = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ''
+        c1 = row.iloc[1] if len(row) > 1 and pd.notna(row.iloc[1]) else None
+        c2 = row.iloc[2] if len(row) > 2 and pd.notna(row.iloc[2]) else None
+        # Détecter la ligne d'en-tête du tableau
+        if 'heures' in c0.lower() and 'total' in c0.lower():
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if not c0 or c0 in ('nan', ''):
+            continue
+        # Ignorer les lignes non-agent (Total, etc.)
+        if c0.lower() in ('total', 'nan', ''):
+            continue
+        agent = normalize_agent_name(c0)
+        if not agent:
+            continue
+        try:
+            marven = float(c1) if c1 is not None else 0.0
+            marsam = float(c2) if c2 is not None else marven
+            result[agent] = {'MarVen': marven, 'MarSam': marsam}
+        except (ValueError, TypeError):
+            pass
+    return result
+
+def parse_jours_speciaux(data, annee):
+    """
+    Lit l'onglet Jours_Speciaux (optionnel, insensible à la casse).
+    Colonnes : Date | Férié (OUI/vide) | Mode_Jeunesse (Vacances/vide)
+    Retourne dict: {date_str: {'ferie': bool, 'mode_jeunesse': str|None}}
+    """
+    # Recherche insensible à la casse
+    sheet_key = next((k for k in data if k.lower() == 'jours_speciaux'), None)
+    if sheet_key is None:
+        return {}
+    df = data[sheet_key]
+    result = {}
+    for _, row in df.iterrows():
+        date_val = row.iloc[0] if pd.notna(row.iloc[0]) else None
+        if date_val is None:
+            continue
+        d = parse_date_flexible(date_val, annee)
+        if d is None:
+            continue
+        date_str  = d.strftime('%Y-%m-%d')
+        ferie_val = str(row.iloc[1]).strip().upper() if len(row) > 1 and pd.notna(row.iloc[1]) else ''
+        mode_j    = str(row.iloc[2]).strip()          if len(row) > 2 and pd.notna(row.iloc[2]) else ''
+        result[date_str] = {
+            'ferie':         ferie_val == 'OUI',
+            'mode_jeunesse': 'Vacances Scolaires' if 'vacances' in mode_j.lower() else None,
+        }
+    return result
+
 def parse_roulement_samedi(data):
     """
-    Nouveau format : blocs SEMAINE_1, SEMAINE_2...
-    Retourne dict: {week_num -> {agent -> 'ROUGE'|'BLEU'}}
-    Vacataires : peuvent avoir 2 valeurs (ROUGE + BLEU) → ils travaillent toujours.
+    Nouveau format : deux tableaux dans l'onglet Roulement_Samedi.
+
+    Tableau 1 — Roulement type (marqueur "Roulement type") :
+        col B = Agent, col C = ROUGE|BLEU
+    Tableau 2 — Exceptions par semaine (marqueur "Exceptions par semaine") :
+        col B = Semaine (numéro), col C = Agent, col D = ROUGE|BLEU
+
+    Logique :
+    - Chaque semaine hérite du roulement type
+    - Les exceptions écrasent uniquement les agents concernés pour la semaine indiquée
+    - Les vacataires absents du tableau 1 reçoivent BOTH par défaut
+    - Si colonne D absente → agent a deux roulements (BOTH)
+
+    Retourne dict: {week_num -> {agent -> 'ROUGE'|'BLEU'|'BOTH'}}
     """
     df = data['Roulement_Samedi']
-    result = {}
-    current_week = None
+
+    roulement_type = {}   # {agent: 'ROUGE'|'BLEU'|'BOTH'}
+    exceptions     = {}   # {week_num: {agent: 'ROUGE'|'BLEU'|'BOTH'}}
+
+    mode = None   # 'type' ou 'exceptions'
+    current_exc_week = None
 
     for _, row in df.iterrows():
-        c0 = str(row.iloc[0]).strip().upper() if pd.notna(row.iloc[0]) else ''
-        c1 = normalize_agent_name(row.iloc[1]) if pd.notna(row.iloc[1]) else None
-        c2 = str(row.iloc[2]).strip().upper() if pd.notna(row.iloc[2]) else ''
+        vals = [str(row.iloc[i]).strip() if pd.notna(row.iloc[i]) else ''
+                for i in range(min(4, len(row)))]
+        raw_all = ' '.join(v.lower() for v in vals)
 
-        if c0.startswith('SEMAINE'):
-            parts = c0.split('_')
-            if len(parts) >= 2:
+        # Détection des marqueurs de section
+        if 'roulement type' in raw_all:
+            mode = 'type'
+            current_exc_week = None
+            continue
+        if 'exception' in raw_all:
+            mode = 'exceptions'
+            current_exc_week = None
+            continue
+        # Ligne d'en-tête → skip (seulement si on n'est pas en mode exceptions
+        # car en exceptions les lignes de continuation ont col B vide)
+        if mode != 'exceptions' and vals[1].lower() in ('agent', 'semaine', ''):
+            continue
+        if mode == 'exceptions' and vals[1].lower() in ('agent', 'semaine') :
+            continue
+
+        if mode == 'type':
+            agent = normalize_agent_name(vals[1]) if vals[1] else None
+            roul  = vals[2].upper() if vals[2] else ''
+            roul2 = vals[3].upper() if vals[3] else ''
+            if not agent or roul not in ('ROUGE', 'BLEU', 'BOTH'):
+                continue
+            if roul2 in ('ROUGE', 'BLEU'):
+                roulement_type[agent] = 'BOTH'
+            else:
+                roulement_type[agent] = roul
+
+        elif mode == 'exceptions':
+            # col B peut être le numéro de semaine (ou vide si continuation)
+            # col C = agent, col D = roulement
+            sem_raw   = vals[1]
+            agent_raw = vals[2]
+            roul_raw  = vals[3].upper() if vals[3] else ''
+
+            # Si col B est un numéro → nouvelle semaine d'exception
+            if sem_raw:
                 try:
-                    current_week = int(parts[1])
-                    if current_week not in result:
-                        result[current_week] = {}
+                    current_exc_week = int(float(sem_raw))
                 except ValueError:
                     pass
-            continue
 
-        if not c1 or c1 in ('Agent', 'nan') or current_week is None:
-            continue
-        if c2 in ('ROUGE', 'BLEU'):
-            # Vacataire avec 2 colonnes → travaille les deux types
-            c3 = str(row.iloc[3]).strip().upper() if len(row) > 3 and pd.notna(row.iloc[3]) else ''
-            if c3 in ('ROUGE', 'BLEU'):
-                result[current_week][c1] = 'BOTH'
-            else:
-                result[current_week][c1] = c2
+            agent = normalize_agent_name(agent_raw) if agent_raw else None
+            if not agent or not current_exc_week:
+                continue
+            if roul_raw not in ('ROUGE', 'BLEU', 'BOTH'):
+                continue
+            if current_exc_week not in exceptions:
+                exceptions[current_exc_week] = {}
+            exceptions[current_exc_week][agent] = roul_raw
 
-    # Fallback semaines manquantes
-    fallback = result.get(1) or result.get(2) or {}
-    for i in range(1, 7):
-        if i not in result:
-            result[i] = dict(fallback)
+    # Construire le résultat semaine par semaine
+    # Les vacataires non listés → BOTH
+    result = {}
+    for week_num in range(1, 7):
+        week_roul = dict(roulement_type)   # copie du type
+        # Appliquer les exceptions de cette semaine
+        for agent, roul in exceptions.get(week_num, {}).items():
+            week_roul[agent] = roul
+        result[week_num] = week_roul
+
     return result
+
 
 def parse_evenements(data, mois_debut, annee_debut, date_fin=None):
     df = data['Événements']
@@ -577,10 +720,26 @@ def parse_planning_type(data):
         'RDC':      [2],
         'Adulte':   [3],
         'MF':       [5, 6],
-        'Jeunesse': [7, 8, 9, 10],  # jusqu'à 4 agents Jeunesse possible
+        'Jeunesse': [7, 8, 9, 10],
     }
     JOUR_MAP = {'MARDI':'Mardi','MERCREDI':'Mercredi','JEUDI':'Jeudi','VENDREDI':'Vendredi'}
     SKIP = {'nan','','R D C','Adulte','Musique & Films','Jeunesse','12H30','15H30','NaN'}
+
+    import re as _re
+    _APDH = _re.compile(
+        r'^(.+?)\s+[àa]\s+(?:partir\s+de\s+|p\s+de\s+|p\.\s*de\s+)(\d+)[hH:]?(\d*)',
+        _re.IGNORECASE
+    )
+
+    def _parse_agent_entry(v):
+        """Retourne (agent_name, from_min_or_None)."""
+        m = _APDH.match(v.strip())
+        if m:
+            agent_raw = m.group(1).strip()
+            h = int(m.group(2))
+            mn = int(m.group(3)) if m.group(3) else 0
+            return normalize_agent_name(agent_raw), h * 60 + mn
+        return normalize_agent_name(v.strip()), None
 
     raw_blocs    = {}
     current_jour = None
@@ -603,34 +762,31 @@ def parse_planning_type(data):
                 current_jour = 'Samedi_BLEU'
                 raw_blocs[current_jour] = []
             else:
-                # Tableaux SAMEDI supplémentaires (ex: planning indicatif) → ignorés
                 current_jour = None
             continue
         if not current_jour or not cell1 or cell1 in SKIP:
             continue
 
+        # bloc : {section: [(agent, from_min_or_None), ...]}
         bloc = {s: [] for s in SECTIONS}
         for section, col_indices in SECTION_COLS.items():
             for ci in col_indices:
                 if ci < len(row):
                     v = str(row.iloc[ci]).strip() if pd.notna(row.iloc[ci]) else ''
                     if v and v not in SKIP:
-                        # Ignorer les valeurs numériques (durées indicatives dans certains PT)
                         try:
                             float(v)
-                            continue  # c'est un nombre → pas un agent
+                            continue
                         except ValueError:
                             pass
-                        # Extraire juste le nom (ignorer "à partir de Xh")
-                        agent_raw = v.split(' à ')[0].split(' à partir')[0].strip()
-                        agent = normalize_agent_name(agent_raw)
+                        agent, from_min = _parse_agent_entry(v)
                         if agent:
                             if section == 'Jeunesse':
-                                if agent not in bloc[section]:
-                                    bloc[section].append(agent)
+                                if agent not in [a for a, _ in bloc[section]]:
+                                    bloc[section].append((agent, from_min))
                             else:
                                 if not bloc[section]:
-                                    bloc[section].append(agent)
+                                    bloc[section].append((agent, from_min))
         raw_blocs[current_jour].append((cell1, bloc))
     return raw_blocs
 
@@ -654,13 +810,24 @@ def explode_planning_type(raw_blocs, creneaux_def):
                 continue
             for cren_name, cs, ce in creneaux_def:
                 if cs >= bs and ce <= be:
-                    # Le dernier bloc non-vide l'emporte — les blocs vides (durées filtrées)
-                    # ne doivent pas écraser les blocs avec agents
-                    has_agents = any(agents for agents in bloc_assignment.values())
+                    # Filtrer les agents selon leur contrainte "à partir de Xh"
+                    filtered = {}
+                    for section, agent_entries in bloc_assignment.items():
+                        agents_for_cren = []
+                        for entry in agent_entries:
+                            if isinstance(entry, tuple):
+                                agent, from_min = entry
+                            else:
+                                agent, from_min = entry, None
+                            # Si "à partir de Xh" : n'inclure que si cs >= from_min
+                            if from_min is not None and cs < from_min:
+                                continue
+                            if agent:
+                                agents_for_cren.append(agent)
+                        filtered[section] = agents_for_cren
+                    has_agents = any(agents for agents in filtered.values())
                     if cren_name not in result[jour_key] or has_agents:
-                        result[jour_key][cren_name] = {
-                            s: list(agents) for s, agents in bloc_assignment.items()
-                        }
+                        result[jour_key][cren_name] = filtered
     return result
 
 
@@ -675,28 +842,21 @@ FLEX_BREAK_DUR = 60   # 1h obligatoire
 
 def _has_flexible_break_samedi(agent, horaires_agents):
     """
-    Retourne True si l'agent bénéficie de la pause flexible samedi :
-    - jour = Samedi
-    - régulier (non vacataire)
-    - a exactement 1h de coupure dans ses horaires qui tombe dans 12h-15h
-    - n'est pas Stéphane
+    Retourne True si l'agent bénéficie de la pause flexible samedi (D14b) :
+    → max 2h SP dans 12h-15h (fenêtre de 3h - 1h de pause obligatoire).
+    Applicable aux réguliers ET aux vacataires ayant une pause dans 12h-15h,
+    et aussi à Stéphane dont la pause est fixe à 12h30.
     """
-    if agent.lower() == 'stéphane':
-        return False
-    if is_vacataire(agent):
-        return False
     h = horaires_agents.get(agent, {}).get('Samedi')
     if h is None:
         return False
     sm, em, sa, ea = h
-    # L'agent doit avoir un matin ET un après-midi ce jour
     if None in (sm, em, sa, ea):
         return False
-    # La coupure = [em, sa]. Elle doit mesurer exactement 1h et être dans 12h-15h
+    # La coupure [em, sa] doit être dans la fenêtre 12h-15h
     break_dur = sa - em
-    if break_dur != FLEX_BREAK_DUR:
+    if break_dur < FLEX_BREAK_DUR:
         return False
-    # La coupure doit être entièrement dans la fenêtre 12h-15h
     if em >= FLEX_BREAK_S and sa <= FLEX_BREAK_E:
         return True
     return False
@@ -835,7 +995,11 @@ def agent_has_meridienne_pause(agent, cren_idx, creneaux, day_assignments,
     Samedi + pause flexible : max 2h SP dans la fenêtre 12h-15h (3h - 1h obligatoire).
     F : Lydie et Delphine sont exemptées — peuvent travailler en continu 10h-14h.
     """
-    # F : exemption Lydie et Delphine
+    # D14 ne s'applique pas aux vacataires : leurs horaires contractuels définissent déjà leurs pauses
+    if is_vacataire(agent):
+        return True
+
+    # Pause flexible Samedi : lue depuis AGENTS_EXCEPTION_MERIDIENNE (colonne Pause_flexible)
     if agent.lower() in AGENTS_EXCEPTION_MERIDIENNE:
         return True
 
@@ -892,7 +1056,6 @@ def count_congés_in_section(section, jour, date_str, affectations, evenements, 
 def violates_consec_hard(agent, jour, cs, ce, cren_idx, creneaux,
                           day_assignments, max_court, max_long,
                           section, date_str, affectations, evenements, horaires_agents):
-    # F : Lydie et Delphine peuvent travailler 10h-14h sans limite (4h exactement)
     if agent.lower() in AGENTS_EXCEPTION_MERIDIENNE and cs < 840:
         return False
     slot_min = ce - cs
@@ -904,8 +1067,9 @@ def violates_consec_hard(agent, jour, cs, ce, cren_idx, creneaux,
         limit = max_long if nb_conges > 0 else max_court
         return consec + slot_min > limit
     else:
-        has_pause = agent_has_pause_before(agent, cren_idx, creneaux, day_assignments)
-        return (consec + slot_min > max_long) and not has_pause
+        # Mer/Sam : max 4h par bloc consécutif.
+        # get_consecutive_sp_before se réinitialise à chaque pause → pas besoin de has_pause
+        return consec + slot_min > max_long
 
 def over_ideal_consec(agent, cren_idx, creneaux, day_assignments, max_court):
     consec = get_consecutive_sp_before(agent, cren_idx, creneaux, day_assignments)
@@ -1015,9 +1179,24 @@ def find_replacement(section, jour, cs, ce, date_str,
         if sp_count.get(agent, 0) + slot_min > sp_max_min.get(agent, 99*60):
             continue
 
-        # D15 : Vacataire max journalier (8h)
+        # D15 : Vacataire max journalier (8h) ET min atteignable sur la journée
         if is_vacataire(agent) and vac_day_sp.get(agent, 0) + slot_min > VAC_MAX:
             continue
+        # D15 : Ne pas placer un vacataire si son minimum SP n'est pas atteignable sur la journée
+        # → compter tous les créneaux disponibles dans toute la journée (pas seulement à partir de cs)
+        if is_vacataire(agent):
+            vac_min = compute_vac_min_sp(agent, jour, horaires_agents)
+            if vac_min > 0 and vac_day_sp.get(agent, 0) == 0:
+                # Premier placement : vérifier total disponible sur toute la journée
+                total_possible = 0
+                for _, _cs, _ce in creneaux:
+                    if not agent_covers_slot(agent, jour, _cs, _ce, horaires_agents):
+                        continue
+                    if agent_blocked_by_event(agent, _cs, _ce, date_str, evenements):
+                        continue
+                    total_possible += (_ce - _cs)
+                if total_possible < vac_min:
+                    continue  # journée trop courte pour atteindre le minimum
 
         # D7/D8 : limite absolue consécutif
         if violates_consec_hard(agent, jour, cs, ce, cren_idx, creneaux,
@@ -1034,30 +1213,20 @@ def find_replacement(section, jour, cs, ce, date_str,
         # Rouge : agent hors section sans alerte → pénalisé fort (D16)
         rouge_score = 1 if is_section_rouge(agent, section, affectations, categories) else 0
 
-        # ── R1/R2/R3 : gestion vacataires avec section dédiée ──────────────
-        # priority_score unifie vac_score + prim en un seul critère :
+        # ── Priorité : réguliers section primaire > réguliers secondaires > vacataires ──
+        # Les vacataires ne remplacent un agent que si aucun régulier n'est disponible.
+        # Ordre :
         #   0 = régulier en section primaire
-        #   1 = vacataire dans sa section dédiée (R1 : avant section secondaire)
-        #   2 = régulier en section secondaire
-        #   3 = vacataire hors section dédiée (R2 : dernier recours, D16 uniquement)
-        vac_section_jour = vac_section_jour or {}
+        #   1 = régulier en section secondaire
+        #   2 = vacataire (respecte ses règles : pas RDC, pas seul Jeunesse, max 3h seul)
+        #   3 = D16 (agent hors section habituelle — dernier recours absolu)
         if is_vacataire(agent):
-            # Trouver la section dédiée de ce vacataire
-            _vkey = next((k for k in vac_section_jour if k.lower() == agent.lower()), None)
-            dedicated = vac_section_jour.get(_vkey)
-
-            if dedicated is not None and dedicated != section:
-                # R2/R3 : vacataire hors sa section dédiée
-                if not allow_any_section:
-                    continue  # R2 : exclure sauf D16
-                priority_score = 3  # D16 fallback uniquement
-            elif vac_prioritaire or force_vacataire:
-                priority_score = 0  # O6 : vacataire prioritaire
-            else:
-                priority_score = 1  # R1 : entre primaire régulier et secondaire régulier
+            if section == 'RDC':
+                continue  # jamais en RDC (D3)
+            priority_score = 2  # vacataire : après tous les réguliers
         else:
-            # Régulier : primaire=0, secondaire=2
-            priority_score = 0 if (agent_sects and agent_sects[0] == section) else 2
+            # Régulier : primaire=0, secondaire=1
+            priority_score = 0 if (agent_sects and agent_sects[0] == section) else 1
 
         # Priorité vacataire : Vacataire 1 avant Vacataire 2
         vac_order = 0
@@ -1135,11 +1304,10 @@ def find_replacement(section, jour, cs, ce, date_str,
 
         candidates.append((
             rouge_score,        # Catégorie : sans-alerte avant rouge (D16)
-            priority_score,     # R1/R2/R3 : prim-régulier < vac-dédié < sec-régulier < vac-hors-dédié
+            priority_score,     # R1/R2/R3 : prim-régulier < sec-régulier < vacataire
             vac_order,          # Vac1 avant Vac2
-            continuity,         # Continuité intra-bloc (prime sur PT-score si consécutif < 3h)
+            continuity,         # Continuité intra-bloc
             responsible_score,  # 0=non-responsable, 1=responsable hors PT (utilisé en dernier)
-            pt_already_score,   # PT : préférer agent absent du PT ce jour pour cette section
             sp_semaine,         # O3 : équité semaine
             over_ideal,         # O7
             mer_score,          # pause méridienne vacataire
@@ -1198,10 +1366,10 @@ def get_besoins_jeunesse_slot(besoins_j, cren_name, jour, samedi_type, semaine_t
 
 def compute_vac_min_sp(agent, jour, horaires_agents):
     """
-    D15 : calcule le SP attendu pour un vacataire.
-    - Journée complète (matin + après-midi) : exactement 8h = 480 min
-    - Demi-journée matin (10h-13h) : exactement 3h = 180 min, SP continu sans pause
-    - Demi-journée après-midi (14h-19h) : exactement 5h = 300 min, SP continu sans pause
+    D15 assoupli : calcule le SP minimum attendu pour un vacataire.
+    - Journée complète → min 6h = 360 min (max 8h géré séparément)
+    - Demi-journée matin → 3h = 180 min
+    - Demi-journée après-midi → 5h = 300 min
     """
     h = horaires_agents.get(agent, {}).get(jour)
     if h is None:
@@ -1210,11 +1378,11 @@ def compute_vac_min_sp(agent, jour, horaires_agents):
     has_matin = sm is not None and em is not None
     has_apm   = sa is not None and ea is not None
     if has_matin and has_apm:
-        return 480  # D15 : 8h si journée complète
+        return 360  # D15 assoupli : min 6h si journée complète
     elif has_matin:
-        return 180  # D15 : 3h si demi-journée matin (10h-13h)
+        return 180
     elif has_apm:
-        return 300  # D15 : 5h si demi-journée après-midi (14h-19h)
+        return 300
     return 0
 
 def vac_is_demi_journee(agent, jour, horaires_agents):
@@ -1234,11 +1402,59 @@ def vac_is_demi_journee(agent, jour, horaires_agents):
     return None
 
 
+def _jeunesse_vac_exclude(section, j_needs, eligible, assigned_this,
+                           jour, cs, ce, date_str, affectations,
+                           horaires_agents, evenements, pt_slot=None):
+    """
+    Si section != Jeunesse ET que Jeunesse a un besoin > 0 que seuls des vacataires
+    peuvent couvrir (aucun régulier libre), renvoie assigned_this + vacataires.
+    Tient compte des agents déjà prévus dans le PT pour d'autres sections.
+    """
+    if section == 'Jeunesse' or j_needs == 0:
+        return set(assigned_this)
+
+    # Agents PT pour sections non-Jeunesse : ils seront consommés, indisponibles pour Jeunesse
+    pt_consumed = set(assigned_this)
+    if pt_slot:
+        for s, agents in pt_slot.items():
+            if s != 'Jeunesse':
+                for a in agents:
+                    if a and not is_vacataire(a):
+                        pt_consumed.add(a)
+
+    # Vérifier s'il reste des réguliers libres pour Jeunesse
+    reguliers_j_dispo = any(
+        not is_vacataire(a)
+        and 'Jeunesse' in affectations.get(a, [])
+        and a not in pt_consumed
+        and agent_available(a, jour, cs, ce, date_str, horaires_agents, evenements)
+        for a in eligible
+    )
+    if reguliers_j_dispo:
+        return set(assigned_this)
+    # Vérifier qu'un vacataire peut couvrir Jeunesse
+    vac_j_dispo = any(
+        is_vacataire(a)
+        and 'Jeunesse' in affectations.get(a, [])
+        and a not in assigned_this
+        and agent_available(a, jour, cs, ce, date_str, horaires_agents, evenements)
+        for a in eligible
+    )
+    if not vac_j_dispo:
+        return set(assigned_this)
+    # Réserver les vacataires pour Jeunesse
+    excl = set(assigned_this)
+    for a in eligible:
+        if is_vacataire(a):
+            excl.add(a)
+    return excl
+
+
 def plan_week(week_num, week_dates, planning_type_base, samedi_type,
               affectations, categories, horaires_agents, horaires_ouverture,
               besoins_jeunesse, sp_minmax_week, roulement_semaine,
               evenements, params, creneaux, semaine_type,
-              responsables=None):
+              responsables=None, jours_speciaux=None):
 
     max_court = parse_duration_param(params.get('Durée_SP_max_idéale', '2h30'), 150)
     max_long  = parse_duration_param(params.get('Durée_SP_max_tolérée', '4h'), 240)
@@ -1248,27 +1464,28 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
     all_agents = list(affectations.keys())
     is_sam_week = 'Samedi' in week_dates
 
-    # D6 : SP min/max en minutes
-    # Si l'agent ne travaille pas le samedi (mauvais roulement), utiliser MarVen même
-    # en semaine avec samedi — les colonnes MarSam ne s'appliquent qu'aux agents roulés.
+    # D6 : SP min = cible PT (heures planning type), SP max = illimité
+    # On utilise les heures PT comme minimum de référence.
+    # Si l'agent ne travaille pas ce samedi → utiliser MarVen
+    pt_hours = sp_minmax_week  # contient les heures PT parsées depuis planning_type
     sp_max_min = {}
     sp_min_min = {}
-    for agent, mm in sp_minmax_week.items():
+    for agent in all_agents:
         agent_roul = roulement_semaine.get(agent, 'BOTH')
         travaille_sam = (
             is_sam_week and
             (agent_roul == 'BOTH' or agent_roul == samedi_type)
         )
-        if travaille_sam:
-            sp_max_min[agent] = mm['Max_MarSam'] * 60
-            sp_min_min[agent] = mm['Min_MarSam'] * 60
-        else:
-            sp_max_min[agent] = mm['Max_MarVen'] * 60
-            sp_min_min[agent] = mm['Min_MarVen'] * 60
-    for agent in all_agents:
-        if is_vacataire(agent) and agent not in sp_max_min:
-            sp_max_min[agent] = 420 * 2
+        if is_vacataire(agent):
+            sp_max_min[agent] = 480 * 2   # 2 jours max
             sp_min_min[agent] = 0
+        else:
+            mm = pt_hours.get(agent, {})
+            if travaille_sam:
+                sp_min_min[agent] = int(mm.get('MarSam', mm.get('Max_MarSam', 0)) * 60)
+            else:
+                sp_min_min[agent] = int(mm.get('MarVen', mm.get('Max_MarVen', 0)) * 60)
+            sp_max_min[agent] = 99 * 60  # pas de max absolu
 
     result    = {}
     sp_count  = defaultdict(int)
@@ -1276,22 +1493,76 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
 
     # ── O6 : détermine si le mercredi est réalisable sans vacataires ──
     def mercredi_realisable_sans_vac(date_str_mer, creneaux_list):
-        """Vérifie si toutes les sections RDC/Adulte/MF/Jeunesse peuvent être
-        couvertes avec les seuls réguliers présents ce mercredi."""
+        """
+        Vérifie si le mercredi peut être couvert par les seuls réguliers,
+        en tenant compte du fait que chaque agent ne peut être que dans une section.
+        Utilise un greedy most-constrained-first par créneau.
+        """
         reguliers = [a for a in all_agents
                      if not is_vacataire(a)
                      and horaires_agents.get(a, {}).get('Mercredi') is not None]
+
         for cren_name, cs, ce in creneaux_list:
             if not creneau_is_open(cs, ce, 'Mercredi', horaires_ouverture):
                 continue
-            for sect in ['RDC', 'Adulte', 'MF']:
-                dispo = [a for a in reguliers
-                         if sect in affectations.get(a, [])
-                         and agent_available(a, 'Mercredi', cs, ce, date_str_mer,
-                                             horaires_agents, evenements)]
-                if not dispo:
-                    return False
+
+            # Agents disponibles pour ce créneau
+            dispo = {a: affectations.get(a, [])
+                     for a in reguliers
+                     if agent_available(a, 'Mercredi', cs, ce, date_str_mer,
+                                        horaires_agents, evenements)}
+
+            # Besoins par section
+            j_besoin = get_besoins_jeunesse_slot(
+                besoins_jeunesse, cren_name, 'Mercredi', 'ROUGE', semaine_type)
+            besoins = {'RDC': 1, 'Adulte': 1, 'MF': 1, 'Jeunesse': j_besoin}
+
+            # Greedy most-constrained-first : trier les sections par nb de candidats croissant
+            sections_a_couvrir = [(s, n) for s, n in besoins.items() if n > 0]
+            assigned = {}  # agent → section
+
+            def candidats_pour(sect):
+                return [a for a in dispo
+                        if sect in dispo[a]
+                        and a not in assigned]
+
+            for _ in range(len(dispo) + 1):  # max iterations
+                # Recalculer l'ordre à chaque passe (contraintes évoluent)
+                sections_restantes = [(s, n) for s, n in sections_a_couvrir
+                                      if len([a for a in assigned.values()
+                                              if a == (s,)]) < n  # placeholder
+                                      ]
+                # Compter combien d'agents sont déjà assignés par section
+                assigned_count = {}
+                for ag, sect in assigned.items():
+                    assigned_count[sect] = assigned_count.get(sect, 0) + 1
+
+                sections_restantes = [(s, n) for s, n in sections_a_couvrir
+                                      if assigned_count.get(s, 0) < n]
+                if not sections_restantes:
+                    break  # toutes sections couvertes
+
+                # Trier par nb de candidats croissant (most constrained first)
+                sections_restantes.sort(key=lambda sn: len(candidats_pour(sn[0])))
+                sect, needed = sections_restantes[0]
+                cands = candidats_pour(sect)
+                if not cands:
+                    return False  # impossible sans vacataire
+                # Assigner le premier candidat (celui avec le moins d'options en Jeunesse priorité)
+                cands.sort(key=lambda a: len(dispo[a]))  # agent le moins flexible en dernier
+                assigned[cands[0]] = sect
+            else:
+                # Vérifier si toutes sections sont bien couvertes
+                assigned_count = {}
+                for ag, sect in assigned.items():
+                    assigned_count[sect] = assigned_count.get(sect, 0) + 1
+                for s, n in sections_a_couvrir:
+                    if assigned_count.get(s, 0) < n:
+                        return False
+
         return True
+
+    jours_speciaux = jours_speciaux or {}
 
     for jour in JOURS_SP:
         date = week_dates.get(jour)
@@ -1299,6 +1570,15 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             continue
         date_str   = date.strftime('%Y-%m-%d')
         is_vac_day = jour.lower() in vac_days
+
+        # ── Jours spéciaux : férié et mode Jeunesse ponctuel ──
+        jour_spec = jours_speciaux.get(date_str, {})
+        if jour_spec.get('ferie', False):
+            result[jour] = {'_ferie': True, '_samedi_type': samedi_type if jour == 'Samedi' else None}
+            continue
+
+        # Mode Jeunesse vacances scolaires pour ce jour uniquement
+        semaine_type_eff = 'Vacances Scolaires' if jour_spec.get('mode_jeunesse') == 'Vacances Scolaires' else semaine_type
 
         # O6 : mercredi → vacataires uniquement si planning non réalisable sans eux
         if jour == 'Mercredi' and is_vac_day:
@@ -1338,38 +1618,12 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
 
         result[jour] = {'_samedi_type': samedi_type if jour == 'Samedi' else None}
 
-        # ── ÉTAPE 0 : pré-assigner chaque vacataire à une section pour la journée ──
-        # (journée complète uniquement — demi-journée gérée par D15 post-O8)
-        # Chaque vacataire se voit attribuer une section exclusive pour la journée.
-        # Les passes A/B utilisent cette info pour leur laisser la priorité.
-        vac_section_jour = {}   # agent -> section dédiée pour la journée
-        vac_sp_obligatoire = {} # agent -> [(cs, ce), ...]  (non utilisé ici, conservé)
+        # ── ÉTAPE 0 supprimée : plus de section fixe par vacataire ──
+        # Les vacataires sont placés naturellement via find_replacement,
+        # après tous les réguliers disponibles (priority_score=2).
+        vac_section_jour = {}   # vide — conservé pour compatibilité des appels
+        vac_sp_obligatoire = {}
 
-        if is_vac_day:
-            vacs_full = sorted(
-                [a for a in eligible if is_vacataire(a)
-                 and vac_is_demi_journee(a, jour, horaires_agents) == 'full'],
-                key=lambda a: (0 if '1' in a else 1)  # Vac1 d'abord
-            )
-            # A : ordre des sections selon affectations Excel de chaque vacataire
-            # B : RDC toujours exclu pour les vacataires
-            used_sects = set()
-            for vac_ag in vacs_full:
-                # Sections selon ordre Excel, sans RDC
-                vac_sects_ordered = [s for s in affectations.get(vac_ag, [])
-                                     if s != 'RDC' and s not in used_sects]
-                # Vérifier que le vacataire est dispo au moins quelques créneaux
-                dispo_crens = [
-                    (cs, ce) for _, cs, ce in creneaux
-                    if creneau_is_open(cs, ce, jour, horaires_ouverture)
-                    and agent_available(vac_ag, jour, cs, ce, date_str,
-                                        horaires_agents, evenements)
-                ]
-                if not dispo_crens:
-                    continue
-                if vac_sects_ordered:
-                    vac_section_jour[vac_ag] = vac_sects_ordered[0]
-                    used_sects.add(vac_sects_ordered[0])
 
         for ag in eligible:
             if not is_vacataire(ag):
@@ -1399,7 +1653,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
 
             # Besoin Jeunesse pour ce créneau
             j_needs = get_besoins_jeunesse_slot(
-                besoins_jeunesse, cren_name, jour, samedi_type, semaine_type)
+                besoins_jeunesse, cren_name, jour, samedi_type, semaine_type_eff)
 
             # ══ PASSE A : valider/remplacer agents du planning type ══
             for section in SECTIONS:
@@ -1411,23 +1665,8 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     pt_agents_orig = pt_agents_orig[:j_needs]
 
                 for agent in pt_agents_orig:
-                    # A : si c'est un vacataire avec une section dédiée différente de cette section,
-                    # on le saute → O6 le placera dans sa section dédiée
-                    # Normaliser le nom pour comparer (le planning type peut avoir VACATAIRE 1 en maj)
-                    if is_vacataire(agent):
-                        # Trouver la clé correspondante dans vac_section_jour
-                        _vag_key = next((k for k in vac_section_jour
-                                         if k.lower() == agent.lower()), None)
-                        if _vag_key and vac_section_jour[_vag_key] != section:
-                            continue  # O6 gère ce vacataire dans sa section dédiée
-                    # Résoudre générique "VACATAIRE(S)"
-                    if agent.upper() in ('VACATAIRES', 'VACATAIRE', 'VACATAIRE 1',
-                                         'VACATAIRE 2') and section != 'Jeunesse':
-                        agent_resolved = agent
-                    elif agent.upper().startswith('VACATAIRE'):
-                        agent_resolved = agent
-                    else:
-                        agent_resolved = agent
+                    # Normaliser le nom (le planning type peut avoir VACATAIRE 1 en majuscules)
+                    agent_resolved = normalize_agent_name(agent) or agent
 
                     if agent_resolved in assigned_this:
                         continue
@@ -1458,6 +1697,12 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         final.append(agent_resolved)
                         assigned_this.add(agent_resolved)
                     else:
+                        # Si Jeunesse a besoin d'un vacataire exclusivement,
+                        # ne pas consommer les vacataires pour RDC/Adulte/MF
+                        _excl_passe_a = _jeunesse_vac_exclude(
+                            section, j_needs, eligible, assigned_this,
+                            jour, cs, ce, date_str, affectations,
+                            horaires_agents, evenements, pt_slot=base_slot)
                         repl, oos = find_replacement(
                             section=section, jour=jour, cs=cs, ce=ce,
                             date_str=date_str, eligible=eligible,
@@ -1470,10 +1715,10 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                             creneaux=creneaux, cren_idx=cren_idx,
                             day_assignments=day_assignments,
                             max_court=max_court, max_long=max_long,
-                            exclude=assigned_this,
+                            exclude=_excl_passe_a,
                             vac_day_sp=vac_day_sp,
-                            force_vacataire=force_vac,
-                            vac_prioritaire=vac_present_jour,
+                            force_vacataire=False,
+                            vac_prioritaire=False,
                             vac_section_jour=vac_section_jour,
                             planning_type_base=planning_type_base,
                             pt_key=pt_key,
@@ -1535,6 +1780,10 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             empty_sections.sort(key=count_candidates)
 
             for section in empty_sections:
+                exclude_for_section = _jeunesse_vac_exclude(
+                    section, j_needs, eligible, assigned_this,
+                    jour, cs, ce, date_str, affectations,
+                    horaires_agents, evenements, pt_slot=base_slot)
                 repl, oos = find_replacement(
                     section=section, jour=jour, cs=cs, ce=ce,
                     date_str=date_str, eligible=eligible,
@@ -1547,9 +1796,9 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     creneaux=creneaux, cren_idx=cren_idx,
                     day_assignments=day_assignments,
                     max_court=max_court, max_long=max_long,
-                    exclude=assigned_this,
+                    exclude=exclude_for_section,
                     vac_day_sp=vac_day_sp,
-                    vac_prioritaire=vac_present_jour,
+                    vac_prioritaire=False,
                     vac_section_jour=vac_section_jour,
                     planning_type_base=planning_type_base,
                     pt_key=pt_key,
@@ -1606,9 +1855,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     # B : vacataires interdits en RDC (Jeunesse OK, pas de check ici)
                     # O6 : vacataire avec section dédiée → ne pas le "consommer" en Jeunesse
                     # sauf s'il est lui-même dédié à Jeunesse
-                    if is_vacataire(agent) and agent in vac_section_jour:
-                        if vac_section_jour[agent] != 'Jeunesse':
-                            continue  # réservé pour sa section dédiée, Passe O6 le placera
+  # réservé pour sa section dédiée, Passe O6 le placera
                     # O3 : SP semaine (prime sur continuité)
                     sp_s = sp_count.get(agent, 0)
                     # C+D+E : continuité par blocs
@@ -1663,79 +1910,89 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                 slot_alerts.append(
                     f"ALERTE — Jeunesse : {len(assignment['Jeunesse'])}/{j_needs} agents")
 
-            # ══ PASSE D : pas de vacataire seul (D11) — vérification finale ══
+            # ══ PASSE D : vacataire seul max 3h consécutives (D11) — toutes sections ══
+            # Règle unifiée : plus d'interdiction Jeunesse hors 12h-14h.
+            # Un vacataire seul dans une section peut rester max 3h consécutives.
             for section in SECTIONS:
                 ag_list = assignment.get(section, [])
                 if not ag_list:
                     continue
-                if all(is_vacataire(a) for a in ag_list):
-                    if not (cs >= exc_vac_s and ce <= exc_vac_e):
-                        # Chercher un régulier parmi TOUS les éligibles (pas seulement non-assignés)
-                        # Si trouvé parmi les déjà-assignés à une autre section → SWAP
-                        found_regular = None
-
-                        # D'abord chercher parmi les non-assignés
-                        repl, _ = find_replacement(
-                            section=section, jour=jour, cs=cs, ce=ce,
-                            date_str=date_str, eligible=eligible,
-                            affectations=affectations,
-                            categories=categories,
-                            horaires_agents=horaires_agents,
-                            evenements=evenements,
-                            sp_count=sp_count, sp_max_min=sp_max_min,
-                            sp_week_count=dict(sp_count),
-                            creneaux=creneaux, cren_idx=cren_idx,
-                            day_assignments=day_assignments,
-                            max_court=max_court, max_long=max_long,
-                            exclude=assigned_this,
-                            vac_day_sp=vac_day_sp,
-                            vac_prioritaire=vac_present_jour,
-                            vac_section_jour=vac_section_jour,
-                            planning_type_base=planning_type_base,
-                            pt_key=pt_key,
-                            responsables=responsables,
-                        )
-                        if repl and not is_vacataire(repl):
-                            found_regular = repl
-                        else:
-                            # Chercher parmi les déjà assignés à d'autres sections
-                            for other_sect in SECTIONS:
-                                if other_sect == section:
+                if not all(is_vacataire(a) for a in ag_list):
+                    continue
+                # Vérifier consécutif vacataire seul dans cette section
+                vac_consec = 0
+                for i in range(cren_idx - 1, -1, -1):
+                    cn_prev, cs_prev, ce_prev = creneaux[i]
+                    slot_prev = day_assignments.get(cn_prev)
+                    if not slot_prev or not isinstance(slot_prev, dict):
+                        break
+                    prev_ags = slot_prev.get('assignment', {}).get(section, [])
+                    if prev_ags and all(is_vacataire(a) for a in prev_ags):
+                        vac_consec += (ce_prev - cs_prev)
+                    else:
+                        break
+                if vac_consec + slot_min > 180:  # >3h consécutif vacataire seul
+                    found_regular = None
+                    repl, _ = find_replacement(
+                        section=section, jour=jour, cs=cs, ce=ce,
+                        date_str=date_str, eligible=eligible,
+                        affectations=affectations,
+                        categories=categories,
+                        horaires_agents=horaires_agents,
+                        evenements=evenements,
+                        sp_count=sp_count, sp_max_min=sp_max_min,
+                        sp_week_count=dict(sp_count),
+                        creneaux=creneaux, cren_idx=cren_idx,
+                        day_assignments=day_assignments,
+                        max_court=max_court, max_long=max_long,
+                        exclude=assigned_this,
+                        vac_day_sp=vac_day_sp,
+                        vac_prioritaire=vac_present_jour,
+                        vac_section_jour=vac_section_jour,
+                        planning_type_base=planning_type_base,
+                        pt_key=pt_key,
+                        responsables=responsables,
+                    )
+                    if repl and not is_vacataire(repl):
+                        found_regular = repl
+                    else:
+                        for other_sect in SECTIONS:
+                            if other_sect == section:
+                                continue
+                            for ag in list(assignment.get(other_sect, [])):
+                                if is_vacataire(ag):
                                     continue
-                                for ag in list(assignment.get(other_sect, [])):
-                                    if is_vacataire(ag):
-                                        continue
-                                    if section not in affectations.get(ag, []):
-                                        continue
-                                    if not agent_available(ag, jour, cs, ce, date_str,
-                                                            horaires_agents, evenements):
-                                        continue
-                                    # SWAP : mettre le vacataire dans l'autre section
-                                    # et l'agent régulier ici
-                                    vac_agent = ag_list[0]
-                                    if other_sect in affectations.get(vac_agent, []):
-                                        assignment[other_sect].remove(ag)
-                                        assignment[other_sect].append(vac_agent)
-                                        # Retirer le vacataire de la section courante
-                                        for v in list(ag_list):
-                                            if is_vacataire(v):
-                                                assignment[section].remove(v)
-                                        found_regular = ag
-                                        break
-                                if found_regular:
+                                if section not in affectations.get(ag, []):
+                                    continue
+                                if is_section_rouge(ag, section, affectations, categories):
+                                    continue
+                                if not agent_available(ag, jour, cs, ce, date_str,
+                                                        horaires_agents, evenements):
+                                    continue
+                                # SWAP
+                                vac_agent = ag_list[0]
+                                if other_sect in affectations.get(vac_agent, []):
+                                    assignment[other_sect].remove(ag)
+                                    assignment[other_sect].append(vac_agent)
+                                    for v in list(ag_list):
+                                        if is_vacataire(v):
+                                            assignment[section].remove(v)
+                                    found_regular = ag
                                     break
+                            if found_regular:
+                                break
 
-                        if found_regular:
-                            if section == 'Jeunesse':
-                                if len(assignment['Jeunesse']) >= j_needs:
-                                    assignment['Jeunesse'].pop()
-                                assignment['Jeunesse'].insert(0, found_regular)
-                            else:
-                                assignment[section] = [found_regular]
-                            assigned_this.add(found_regular)
+                    if found_regular:
+                        if section == 'Jeunesse':
+                            if len(assignment['Jeunesse']) >= j_needs:
+                                assignment['Jeunesse'].pop()
+                            assignment['Jeunesse'].insert(0, found_regular)
                         else:
-                            slot_alerts.append(
-                                f"ALERTE — {section} : vacataire seul hors 12h-14h")
+                            assignment[section] = [found_regular]
+                        assigned_this.add(found_regular)
+                    else:
+                        slot_alerts.append(
+                            f"ALERTE — {section} : vacataire seul >3h")
 
             # ══ PASSE E : D16 final pour RDC/Adulte/MF encore vides ══
             for section in ['RDC', 'Adulte', 'MF']:
@@ -1755,7 +2012,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         exclude=assigned_this,
                         vac_day_sp=vac_day_sp,
                         allow_any_section=True,  # D16
-                        vac_prioritaire=vac_present_jour,
+                        vac_prioritaire=False,
                         vac_section_jour=vac_section_jour,
                         planning_type_base=planning_type_base,
                         pt_key=pt_key,
@@ -1768,114 +2025,8 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     else:
                         slot_alerts.append(f"ALERTE — {section} : aucun agent disponible")
 
-            # ══ PASSE O6 : placer vacataire dans sa section dédiée (8h/jour) ══
-            # Utilise vac_section_jour défini en ÉTAPE 0.
-            # Le vacataire remplace le régulier dans sa section dédiée.
-            # Le régulier éjecté est récupéré par O8 si son min SP n'est pas atteint.
-            if is_vac_day:
-                for vac_ag, sect_ded in vac_section_jour.items():
-                    if not agent_available(vac_ag, jour, cs, ce, date_str,
-                                            horaires_agents, evenements):
-                        continue
-                    # D15 : ne pas dépasser 8h
-                    if vac_day_sp.get(vac_ag, 0) + slot_min > 480:
-                        continue
-                    # Pause méridienne obligatoire (au moins 1h dans 12h-14h)
-                    if not agent_has_meridienne_pause(vac_ag, cren_idx, creneaux,
-                                                       day_assignments, horaires_agents, jour):
-                        continue
-                    # Déjà assigné ce créneau ?
-                    if any(vac_ag in assignment.get(s, []) for s in SECTIONS):
-                        continue
-                    # Section dédiée : placer ou évincer
-                    curr = assignment.get(sect_ded, [])
-                    placed = False
-                    # Capacité maximale de la section dédiée pour ce créneau
-                    if sect_ded == 'Jeunesse':
-                        sect_cap = j_needs  # D4 : ne pas dépasser le besoin Jeunesse
-                    else:
-                        sect_cap = 1        # D3 : max 1 agent pour RDC/Adulte/MF
-
-                    if not curr:
-                        # Section vide : ajouter directement
-                        if sect_ded == 'Jeunesse' and j_needs == 0:
-                            pass  # D4 : pas de besoin Jeunesse ce créneau
-                        else:
-                            assignment[sect_ded].append(vac_ag)
-                            assigned_this.add(vac_ag)
-                            placed = True
-                    elif sect_ded == 'Jeunesse' and len(curr) < j_needs:
-                        # Jeunesse : ajouter si besoin non encore comblé
-                        assignment['Jeunesse'].append(vac_ag)
-                        assigned_this.add(vac_ag)
-                        placed = True
-                    elif sect_ded == 'Jeunesse' and len(curr) < j_needs:
-                        # Jeunesse incomplète → ajouter le vacataire directement
-                        assignment['Jeunesse'].append(vac_ag)
-                        assigned_this.add(vac_ag)
-                        placed = True
-                    elif sect_ded == 'Jeunesse' and len(curr) >= j_needs                             and j_needs >= 1                             and not any(is_vacataire(a) for a in curr):
-                        # Jeunesse pleine de réguliers → remplacer 1 régulier par le vacataire
-                        # Choisir le régulier le plus facile à déplacer (le plus polyvalent)
-                        best_displaced = None
-                        for cand in sorted(curr,
-                                key=lambda a: -len(affectations.get(a,[]))):
-                            d_sects = affectations.get(cand, [])
-                            # Peut-il aller ailleurs ?
-                            can_go = any(
-                                s2 in d_sects and not assignment.get(s2)
-                                and agent_available(cand, jour, cs, ce, date_str,
-                                                    horaires_agents, evenements)
-                                for s2 in ['RDC', 'Adulte', 'MF']
-                            )
-                            if can_go or True:  # toujours évincer si besoin
-                                best_displaced = cand
-                                break
-                        if best_displaced:
-                            d_sects = affectations.get(best_displaced, [])
-                            relocated = False
-                            for s2 in ['RDC', 'Adulte', 'MF']:
-                                if s2 not in d_sects: continue
-                                if assignment.get(s2): continue
-                                if not agent_available(best_displaced, jour, cs, ce,
-                                                        date_str, horaires_agents, evenements):
-                                    continue
-                                assignment[s2] = [best_displaced]
-                                assignment['Jeunesse'] = [a for a in assignment['Jeunesse']
-                                                          if a != best_displaced] + [vac_ag]
-                                assigned_this.add(vac_ag)
-                                placed = True
-                                relocated = True
-                                break
-                            if not placed:
-                                # Évincer sans relocalisation (O8 récupère)
-                                assignment['Jeunesse'] = [a for a in assignment['Jeunesse']
-                                                          if a != best_displaced] + [vac_ag]
-                                assigned_this.add(vac_ag)
-                                placed = True
-                    elif len(curr) == 1 and not is_vacataire(curr[0])                             and sect_ded != 'Jeunesse':
-                        displaced = curr[0]
-                        if displaced.lower() == 'stéphane':
-                            continue  # D17
-                        d_sects = affectations.get(displaced, [])
-                        # Essai 1 : relocaliser dans une autre section libre
-                        for s2 in ['RDC', 'Adulte', 'MF']:
-                            if s2 == sect_ded: continue
-                            if s2 not in d_sects: continue
-                            if assignment.get(s2): continue
-                            if not agent_available(displaced, jour, cs, ce, date_str,
-                                                    horaires_agents, evenements):
-                                continue
-                            assignment[s2]       = [displaced]
-                            assignment[sect_ded] = [vac_ag]
-                            assigned_this.add(vac_ag)
-                            placed = True
-                            break
-                        # Essai 2 : évincer (vacataire prioritaire absolu — O8 récupèrera le régulier)
-                        if not placed:
-                            assignment[sect_ded] = [vac_ag]
-                            assigned_this.add(vac_ag)
-                            placed = True
+            # ══ PASSE O6 supprimée : vacataires placés via find_replacement ══
+            # (priority_score=2, après tous les réguliers disponibles)
 
             # ══ Nettoyage alertes obsolètes Jeunesse ══
             # Recalculer après toutes les passes (Passe C peut avoir alerté prématurément)
@@ -1996,17 +2147,16 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
     # Skip si un vacataire est disponible sur ce créneau (O6 priorité vac)
     # ══════════════════════════════════════════════════════════
     sp_alerts = {}
-    for agent in list(sp_minmax_week.keys()):
+    for agent in all_agents:
         if is_vacataire(agent):
             continue
-        mm     = sp_minmax_week.get(agent, {})
         agent_roul_o8 = roulement_semaine.get(agent, 'BOTH')
         travaille_sam_o8 = (
             is_sam_week and
             (agent_roul_o8 == 'BOTH' or agent_roul_o8 == samedi_type)
         )
-        min_sp = (mm['Min_MarSam'] if travaille_sam_o8 else mm['Min_MarVen']) * 60
-        max_sp = (mm['Max_MarSam'] if travaille_sam_o8 else mm['Max_MarVen']) * 60
+        min_sp = sp_min_min.get(agent, 0)
+        max_sp = sp_max_min.get(agent, 99 * 60)
         actual = sp_count.get(agent, 0)
         # O8 : viser le MIN SP (objectif idéal).
         # Le MAX reste une limite absolue (D6). L'alerte est générée si min non atteint.
@@ -2019,6 +2169,7 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             date = week_dates.get(jour)
             if date is None:
                 continue
+            pt_key_o8 = f"Samedi_{samedi_type}" if jour == 'Samedi' else jour
             # O8 : vérifier le roulement samedi
             if jour == 'Samedi':
                 sam_type_o8 = result.get('Samedi', {}).get('_samedi_type') or samedi_type
@@ -2053,15 +2204,30 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     )
                     if vac_dispo_o8:
                         continue
-                for section in ['Jeunesse', 'RDC', 'Adulte', 'MF']:
+                # O8 : privilégier la section primaire de l'agent
+                # et respecter le PT (si l'agent est dans le PT, l'y mettre en priorité)
+                agent_sects_o8 = affectations.get(agent, [])
+                pt_slot_o8 = (planning_type_base.get(pt_key_o8, {}).get(cren_name, {})
+                              if planning_type_base else {})
+                pt_sections_o8 = [s for s in SECTIONS if agent in pt_slot_o8.get(s, [])]
+                # Si l'agent est dans le PT pour ce créneau → utiliser uniquement sa section PT
+                # Sinon → ordre : section primaire d'abord, puis secondaires
+                if pt_sections_o8:
+                    sections_o8 = pt_sections_o8
+                else:
+                    sections_o8 = ([agent_sects_o8[0]] + [s for s in agent_sects_o8[1:]]
+                                   if agent_sects_o8 else [])
+                for section in sections_o8:
                     if section not in affectations.get(agent, []):
                         continue
                     # D4 : ne pas dépasser le besoin Jeunesse
                     if section == 'Jeunesse':
+                        _sam_t = result[jour].get('_samedi_type', 'ROUGE')
+                        _sem_t_o8 = ('Vacances Scolaires'
+                                     if jours_speciaux.get(date_str, {}).get('mode_jeunesse') == 'Vacances Scolaires'
+                                     else semaine_type)
                         j_needs_slot = get_besoins_jeunesse_slot(
-                            besoins_jeunesse, cren_name, jour,
-                            result[jour].get('_samedi_type', 'ROUGE'),
-                            semaine_type)
+                            besoins_jeunesse, cren_name, jour, _sam_t, _sem_t_o8)
                         if len(assignment['Jeunesse']) >= j_needs_slot:
                             continue
                     else:
@@ -2122,9 +2288,12 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                     if sect not in affectations.get(ag, []):
                         continue
                     if sect == 'Jeunesse':
+                        _sem_t_d15 = ('Vacances Scolaires'
+                                      if jours_speciaux.get(date_str_d15, {}).get('mode_jeunesse') == 'Vacances Scolaires'
+                                      else semaine_type)
                         jn = get_besoins_jeunesse_slot(
                             besoins_jeunesse, cren_name, jour,
-                            result[jour].get('_samedi_type', 'ROUGE'), semaine_type)
+                            result[jour].get('_samedi_type', 'ROUGE'), _sem_t_d15)
                         if len(assignment_d15['Jeunesse']) >= jn:
                             continue
                     else:
@@ -2144,8 +2313,18 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             if not slot or not isinstance(slot, dict) or not slot.get('open'): continue
             j_ag = slot.get('assignment', {}).get('Jeunesse', [])
             sam_t = jp.get('_samedi_type', 'ROUGE')
+            _date_str_cleanup = None
+            for _j2 in JOURS_SP:
+                if result.get(_j2, {}) is jp: _date_str_cleanup = _j2; break
+            _sem_t_cleanup = semaine_type
+            if _date_str_cleanup:
+                _d = week_dates.get(_date_str_cleanup)
+                if _d:
+                    _sem_t_cleanup = ('Vacances Scolaires'
+                                      if jours_speciaux.get(_d.strftime('%Y-%m-%d'), {}).get('mode_jeunesse') == 'Vacances Scolaires'
+                                      else semaine_type)
             j_needs_post = get_besoins_jeunesse_slot(
-                besoins_jeunesse, cn, jour, sam_t, semaine_type)
+                besoins_jeunesse, cn, jour, sam_t, _sem_t_cleanup)
             old_alerts = slot.get('alerts', [])
             new_alerts = [al for al in old_alerts if 'Jeunesse' not in al]
             if len(j_ag) < j_needs_post:
@@ -2219,10 +2398,16 @@ def compute_full_planning(filepath):
     raw              = load_excel_data(filepath)
     params           = parse_parametres(raw)
     horaires_ouv     = parse_horaires_ouverture(raw)
-    affectations, categories, responsables = parse_affectations(raw)
+    affectations, categories, responsables, pause_flexible = parse_affectations(raw)
+
+    # Peupler AGENTS_EXCEPTION_MERIDIENNE depuis la colonne Pause_flexible
+    global AGENTS_EXCEPTION_MERIDIENNE
+    AGENTS_EXCEPTION_MERIDIENNE = {a.lower() for a in pause_flexible}
+
     horaires_agents  = parse_horaires_agents(raw)
     besoins_j        = parse_besoins_jeunesse(raw)
     sp_minmax_all    = parse_sp_minmax(raw)
+    pt_hours_all     = parse_pt_hours(raw)
     roulement_all    = parse_roulement_samedi(raw)
     creneaux         = parse_creneaux(params)
     samedi_types     = parse_samedi_types(params)
@@ -2231,6 +2416,8 @@ def compute_full_planning(filepath):
     mois_str = str(params.get('Mois', 'janvier')).strip().lower()
     annee    = int(params.get('Année', 2026))
     mois_num = MOIS_MAP.get(mois_str, 1)
+
+    jours_speciaux   = parse_jours_speciaux(raw, annee)
 
     weeks    = get_weeks_of_month(mois_num, annee)
     date_fin = weeks[-1].get('Samedi') if weeks else None
@@ -2257,13 +2444,14 @@ def compute_full_planning(filepath):
             horaires_agents    = horaires_agents,
             horaires_ouverture = horaires_ouv,
             besoins_jeunesse   = besoins_j,
-            sp_minmax_week     = sp_minmax_week,
+            sp_minmax_week     = pt_hours_all,
             roulement_semaine  = roulement_sem,
             evenements         = evenements,
             params             = params,
             creneaux           = creneaux,
             semaine_type       = semaine_type,
             responsables       = responsables,
+            jours_speciaux     = jours_speciaux,
         )
         results.append({
             'week_num':    week_num,
@@ -2286,9 +2474,11 @@ def compute_full_planning(filepath):
         'horaires_agents': horaires_agents,
         'roulement_all':   roulement_all,
         'sp_minmax_all':   sp_minmax_all,
+        'pt_hours_all':    pt_hours_all,
         'evenements':      evenements,
         'besoins_j':       besoins_j,
         'semaines_type':   semaines_type,
         'responsables':    responsables,
+        'jours_speciaux':  jours_speciaux,
     }
     return results, metadata
