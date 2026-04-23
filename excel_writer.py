@@ -44,7 +44,7 @@ C = {
     'sp_alert_t': '8B0000',
     'hdr_rdc':    '2980B9', 'hdr_adulte':'27AE60', 'hdr_mf':      'E67E22',
     'hdr_j':      'E74C3C', 'hdr_purple':'8E44AD', 'hdr_dark2':   '34495E',
-    'oos_bg':     'FF0000', 'oos_txt':   'FFFFFF',
+    'oos_bg':     'FFCDD2', 'oos_txt':   '8B0000',
     'vac_bg':     'F0E6FF', 'vac_txt':   '6A0DAD',
     # Congé : rouge très doux (remplace FFCCCC/8B0000)
     'conge_bg':   'FADBD8', 'conge_txt': '922B21',
@@ -192,6 +192,9 @@ def _merge_consecutive_agent_cells(ws, col, row_start, row_end):
         c = ws.cell(row=r, column=col)
         v = c.value
         v_str = _cell_text(v)
+        # La sentinelle '·' (hors-horaires) est traitée comme vide pour la fusion
+        if v_str == '·':
+            v_str = None
         if v_str is not None:
             return ('val', v_str)
         # Cellule vide : clé = type de remplissage
@@ -244,98 +247,22 @@ def _ev_txt_color():
     return '4A148C'
 
 
-def _rich_agents(agents, cren_range=None, oos=False):
-    """
-    CellRichText : agents colorés + créneau gris optionnel en dessous.
-    cren_range est ajouté après fusion (ex: '10:00-12:00').
-    """
+def _rich_agents(agents, oos=False):
+    """CellRichText : agents avec couleurs distinctes, séparateur gris."""
     parts = []
     sep_font = InlineFont(color='AAAAAA', b=False, sz=9)
-    cren_font = InlineFont(color='AAAAAA', b=False, sz=8)
-
     for i, agent in enumerate(agents):
         if i > 0:
             parts.append(TextBlock(sep_font, '  /  '))
-        color = 'FFFFFF' if oos else agent_color(agent)
+        color = C['oos_txt'] if oos else agent_color(agent)
         af = InlineFont(color=color, b=True, sz=10)
         parts.append(TextBlock(af, agent))
+    return CellRichText(*parts) if parts else None
 
     if cren_range:
         parts.append(TextBlock(cren_font, f'\n{cren_range}'))
 
     return CellRichText(*parts) if parts else None
-
-
-def _add_cren_to_rich(cell, cren_range):
-    """Ajoute le créneau gris à une cellule CellRichText existante (post-merge)."""
-    v = cell.value
-    if v is None:
-        return
-    cren_font = InlineFont(color='AAAAAA', b=False, sz=8)
-    try:
-        from openpyxl.cell.rich_text import CellRichText, TextBlock
-        if isinstance(v, CellRichText):
-            # Supprimer un éventuel créneau déjà présent (commence par \n)
-            parts = [b for b in v if not (hasattr(b, 'text') and str(b.text).startswith('\n'))]
-            parts.append(TextBlock(cren_font, f'\n{cren_range}'))
-            cell.value = CellRichText(*parts)
-        else:
-            # Texte simple
-            txt = str(v).split('\n')[0]
-            cell.value = f'{txt}\n{cren_range}'
-    except Exception:
-        pass
-
-
-def _merge_and_time(ws, col, row_start, row_end, row_cren_map):
-    """
-    Fusionne les cellules consécutives de même contenu agents dans une colonne.
-    Après fusion, ajoute le créneau fusionné (ex: '10:00-12:00') en gris.
-    row_cren_map : {row_number: (cren_name, cs, ce)} — construit pendant l'écriture.
-    Les cellules '—' (vides) sont fusionnées sans ajout de créneau.
-    """
-    if row_start >= row_end:
-        return
-
-    i = row_start
-    while i <= row_end:
-        val_i = _cell_text(ws.cell(row=i, column=col).value)
-        if val_i is not None:
-            j = i + 1
-            while j <= row_end and _cell_text(ws.cell(row=j, column=col).value) == val_i:
-                j += 1
-
-            # Créneau fusionné — seulement si cellule contient un agent (pas '—')
-            cren_range = None
-            if val_i.strip() not in ('—', ''):
-                cs_list = [row_cren_map[r][1] for r in range(i, j) if r in row_cren_map]
-                ce_list = [row_cren_map[r][2] for r in range(i, j) if r in row_cren_map]
-                if cs_list and ce_list:
-                    cs_min, ce_max = min(cs_list), max(ce_list)
-                    cren_range = (f"{cs_min//60:02d}:{cs_min%60:02d}"
-                                  f"-{ce_max//60:02d}:{ce_max%60:02d}")
-
-            if j > i + 1:
-                src = ws.cell(row=i, column=col)
-                src_fill  = copy(src.fill)
-                src_font  = copy(src.font)
-                src_align = copy(src.alignment)
-                src_bord  = copy(src.border)
-                ws.merge_cells(start_row=i, start_column=col,
-                               end_row=j-1, end_column=col)
-                mc = ws.cell(row=i, column=col)
-                mc.fill      = src_fill
-                mc.font      = src_font
-                mc.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-                mc.border    = src_bord
-                if cren_range:
-                    _add_cren_to_rich(mc, cren_range)
-            else:
-                if cren_range:
-                    _add_cren_to_rich(ws.cell(row=i, column=col), cren_range)
-            i = j
-        else:
-            i += 1
 
 
 def _set_rich(cell, rich_val, bg, brd=None):
@@ -492,10 +419,8 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
 
         # Mémoriser la première ligne de créneaux pour ce jour
         _cren_start_row = row
-        row_cren_map = {}   # {row_number: (cren_name, cs, ce)}
 
         for ni,(cren_name,cs,ce) in enumerate(creneaux):
-            row_cren_map[row] = (cren_name, cs, ce)   # ← enregistrement avant écriture
             slot = jour_plan.get(cren_name)
             if slot is None:
                 # Événements pendant ce créneau fermé (réunions, formations hors ouverture)
@@ -537,14 +462,24 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
                     is_oos  = oos.get(sect, False)
 
                     if is_oos and agents:
-                        rich = _rich_agents(agents, oos=True)  # créneau ajouté post-merge
-                        cell = ws.cell(row=row, column=col)
-                        _set_rich(cell, rich, C['oos_bg'], _brd())
+                        # Plain text pour que SEARCH fonctionne
+                        val = '  /  '.join(agents)
+                        _set(ws.cell(row=row, column=col, value=val),
+                             bg=C['oos_bg'],
+                             fnt=_font(size=10, color=C['oos_txt'], bold=True),
+                             aln=_aln('center'), brd=_brd())
                     elif agents:
                         bg   = SEC_BG[sect]
-                        rich = _rich_agents(agents)            # créneau ajouté post-merge
                         cell = ws.cell(row=row, column=col)
-                        _set_rich(cell, rich, bg, _brd())
+                        if len(agents) == 1:
+                            # Un seul agent → plain text (SEARCH fonctionne)
+                            _set(cell, value=agents[0],
+                                 bg=bg,
+                                 fnt=_font(size=10, color=agent_color(agents[0]), bold=True),
+                                 aln=_aln('center'), brd=_brd())
+                        else:
+                            # Plusieurs agents → CellRichText pour couleurs distinctes
+                            _set_rich(cell, _rich_agents(agents), bg, _brd())
                     elif has_al:
                         _set(ws.cell(row=row, column=col, value='ALERTE'),
                              bg=C['conge_bg'],
@@ -574,16 +509,6 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
 
         # Mémoriser la dernière ligne de créneaux pour ce jour
         jour_cren_rows[jour] = (_cren_start_row, row - 1)
-
-        # Fusionner cellules consécutives :
-        # Sections B-E : _merge_and_time
-        # Événements F-I : _merge_consecutive_cells
-        last_cren_row = row - 1
-        if _cren_start_row < last_cren_row:
-            for sect_col in range(2, 6):   # B=2 RDC, C=3 Adulte, D=4 MF, E=5 Jeunesse
-                _merge_and_time(ws, sect_col, _cren_start_row, last_cren_row, row_cren_map)
-            for ev_col in range(6, 10):    # F=6, G=7, H=8, I=9
-                _merge_consecutive_cells(ws, ev_col, _cren_start_row, last_cren_row)
 
         for ci in range(1, 10):
             ws.cell(row=row, column=ci).fill = _fill('F0F3F4')
@@ -707,7 +632,7 @@ def write_week_sheet(wb, week_data, metadata, agent_sp_cells=None):
     ws.merge_cells(f'A{row}:I{row}')
     _set(ws.cell(row=row, column=1,
                  value="Vert=OK  |  Rouge=sous min  |  Orange=sur max  |  "
-                       "Violet=vacataire  |  Rouge vif cellule planning=agent hors section"),
+                       "Violet=vacataire  |  Rose = agent hors section habituelle"),
          bg='F4F6F7', fnt=_font(size=9, italic=True, color='5D6D7E'), aln=_aln('left'))
     ws.row_dimensions[row].height = 16
     return ws, jour_cren_rows
@@ -786,7 +711,7 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
     _set(ws.cell(row=row, column=1,
                  value="  SP = section (couleur)     Arr./Fin XXhYY = horaire décalé (gris)     "
                        "Gris uni = au bureau hors SP     Hachures = hors horaires     "
-                       "Jaune = événement / congé     Rouge vif = hors section habituelle"),
+                       "Jaune = événement / congé     Rose = hors section habituelle"),
          bg='34495E', fnt=_font(size=9, italic=True, color='FFFFFF'), aln=_aln('left'))
     ws.row_dimensions[row].height = 15
     row += 2
@@ -898,9 +823,7 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
         # ── Lignes d'arrivée (8h30-9h et 9h-10h) ───────────────
         # Même formatage colonne B que les créneaux SP
         early_start_row = row  # pour la fusion sur la plage complète
-        pa_row_cren_map = {}   # {row: (slot_name, cs, ce)} pour _merge_and_time
         for slot_name, es, ee in EARLY_SLOTS:
-            pa_row_cren_map[row] = (slot_name, es, ee)
             _set(ws.cell(row=row, column=1), bg='F8F9FA')
             ws.cell(row=row, column=1).value = ''
             # Colonne B : même style que les créneaux SP normaux
@@ -988,18 +911,16 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
             row += 1
 
         # ── Lignes créneaux SP (10h → 19h) ─────────────────────
-        cren_start_row = row  # première ligne SP (pour la formule)
+        cren_start_row = row  # première ligne SP (pour la formule TOTAL)
 
         for cren_idx, (cren_name, cs, ce) in enumerate(creneaux):
-            pa_row_cren_map[row] = (cren_name, cs, ce)  # ← pour _merge_and_time
-            # Colonne A : durée en heures décimales (police blanche = invisible)
-            # Utilisée par la formule SUMPRODUCT pour éviter les tableaux littéraux
+
             dur_h = round((ce - cs) / 60, 4)
             dur_cell = ws.cell(row=row, column=1)
             dur_cell.value = dur_h
             dur_cell.number_format = '0.00'
             dur_cell.fill = _fill('F8F9FA')
-            dur_cell.font = _font(size=8, color='F8F9FA')  # invisible (blanc sur blanc)
+            dur_cell.font = _font(size=8, color='F8F9FA')
             dur_cell.alignment = _aln()
             _set(ws.cell(row=row, column=2, value=cren_name),
                  bg='FDFEFE', fnt=_font(bold=True, size=9), aln=_aln(), brd=_brd())
@@ -1058,43 +979,87 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
                          aln=_aln(), brd=_brd())
                 elif sp_section and is_oos_cell:
                     sec_label = 'M & F' if sp_section == 'MF' else sp_section
-                    _set(cell, value=f"SP\n{sec_label}\n⚠",
+                    _set(cell, value=f"SP\n{sec_label} ⚠",
                          bg=C['oos_bg'],
-                         fnt=_font(size=8, bold=True, color=C['oos_txt']),
+                         fnt=_font(size=9, bold=True, color=C['oos_txt']),
                          aln=_aln(), brd=_brd())
-                elif sp_section:
-                    # Agent en SP — statique, couleur section (créneau ajouté post-merge)
-                    sec_label = 'M & F' if sp_section == 'MF' else sp_section
-                    bg_sp = SEC_BG.get(sp_section, 'FFFFFF')
-                    sp_font = InlineFont(color='1A1A1A', b=True, sz=9)
-                    rich = CellRichText(TextBlock(sp_font, f'SP\n{sec_label}'))
-                    cell.value = rich
-                    cell.fill = _fill(bg_sp)
-                    cell.alignment = _aln()
-                    cell.border = _brd()
                 elif not in_horaires:
-                    # Hors horaires (dont pause méridienne) → hachures
-                    cell.fill = _hatch()
-                    cell.value = None
-                    cell.font = _font(size=10, color=C['off_txt'])
+                    # Hors horaires → hachures + sentinelle '·'
+                    cell.fill  = _hatch()
+                    cell.value = '·'
+                    cell.font  = _font(size=6, color='F5F5F5')
                     cell.alignment = _aln()
-                    cell.border = _brd()
+                    cell.border    = _brd()
                 else:
-                    # Au bureau, pas de SP, pas d'événement → gris sobre
-                    cell.value = None
-                    cell.fill = _fill('F0F0F0')
-                    cell.font = _font(size=8, color=C['gray'])
-                    cell.alignment = _aln()
-                    cell.border = Border(
-                        left=Side(style='medium', color='AAAAAA'),
-                        right=Side(style='thin', color='DDDDDD'),
-                        top=Side(style='thin', color='DDDDDD'),
-                        bottom=Side(style='thin', color='DDDDDD'))
+                    # SP ou bureau → formule IF dynamique cross-sheet
+                    # 1 cellule = 1 créneau, pas de fusion (le créneau est dans col B)
+                    if jour_cren_rows and jour in jour_cren_rows:
+                        sem_sht = f'Semaine_{week_num}'
+                        ag_esc  = agent.replace('"', '""')
+                        r_sem   = jour_cren_rows[jour][0] + cren_idx
+                        # IF imbriqués : B=RDC, C=Adulte, D=MF, E=Jeunesse
+                        formula = (
+                            '=IF(ISNUMBER(SEARCH("' + ag_esc + '",\'' + sem_sht + '\'!B' + str(r_sem) + ')),"SP"&CHAR(10)&"RDC",'
+                            'IF(ISNUMBER(SEARCH("' + ag_esc + '",\'' + sem_sht + '\'!C' + str(r_sem) + ')),"SP"&CHAR(10)&"Adulte",'
+                            'IF(ISNUMBER(SEARCH("' + ag_esc + '",\'' + sem_sht + '\'!D' + str(r_sem) + ')),"SP"&CHAR(10)&"M & F",'
+                            'IF(ISNUMBER(SEARCH("' + ag_esc + '",\'' + sem_sht + '\'!E' + str(r_sem) + ')),"SP"&CHAR(10)&"Jeunesse",""))))'
+                        )
+                        cell.value     = formula
+                        cell.alignment = _aln()
+                        cell.border    = _brd()
+                        # Fond initial selon section connue du moteur
+                        # CF la mettra à jour si l'agent change de section dans Semaine_N
+                        if sp_section:
+                            cell.fill = _fill(SEC_BG.get(sp_section, 'FFFFFF'))
+                            cell.font = _font(size=9, bold=True, color='1A1A1A')
+                        else:
+                            # Au bureau : fond gris statique (pas de CF bureau)
+                            cell.fill = _fill('F0F0F0')
+                            cell.font = _font(size=8, color='888888')
+                    else:
+                        # Fallback statique
+                        if sp_section:
+                            sec_label = 'M & F' if sp_section == 'MF' else sp_section
+                            _set(cell, value=f"SP\n{sec_label}",
+                                 bg=SEC_BG.get(sp_section, 'FFFFFF'),
+                                 fnt=_font(size=9, bold=True, color='1A1A1A'),
+                                 aln=_aln(), brd=_brd())
+                        else:
+                            cell.value = ''
+                            cell.fill  = _fill('F0F0F0')
+                            cell.font  = _font(size=8, color=C['gray'])
+                            cell.alignment = _aln()
+                            cell.border    = _brd()
 
             ws.row_dimensions[row].height = 28
             row += 1
 
         cren_end_row = row - 1  # dernière ligne SP (inclusive)
+
+        # ── Mise en forme conditionnelle sur la plage créneaux ──────
+        if jours_presents and jour_cren_rows:
+            col_start = col_map[jours_presents[0]]
+            col_end   = col_map[jours_presents[-1]]
+            cf_range  = (f"{get_column_letter(col_start)}{cren_start_row}:"
+                         f"{get_column_letter(col_end)}{cren_end_row}")
+            anc = f"{get_column_letter(col_start)}{cren_start_row}"
+
+            # CF sections : colore quand la formule IF retourne "SP\nXxx"
+            # Fond initial = couleur section (si SP connu du moteur), sinon gris
+            # → pas de règle CF pour "" (bureau) car elle écraserait les fonds section
+            sect_rules = [
+                (SEC_BG['RDC'],      f'ISNUMBER(SEARCH("RDC",{anc}))'),
+                (SEC_BG['Adulte'],   f'ISNUMBER(SEARCH("Adulte",{anc}))'),
+                (SEC_BG['MF'],       f'ISNUMBER(SEARCH("M & F",{anc}))'),
+                (SEC_BG['Jeunesse'], f'ISNUMBER(SEARCH("Jeunesse",{anc}))'),
+            ]
+            for color, formula in sect_rules:
+                ws.conditional_formatting.add(cf_range, FormulaRule(
+                    formula=[formula],
+                    fill=PatternFill(fill_type='solid', fgColor=color),
+                    font=Font(size=9, bold=True, color='1A1A1A'),
+                    stopIfTrue=True
+                ))
 
         # ── Créneau tardif (après 19h) ──────────────────────────
         late_name, ls, le = LATE_SLOT
@@ -1202,8 +1167,8 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
                     for sc in SEC_COLS_SEM
                 )
                 formula = (
-                    '=SUMPRODUCT((' + search_parts + '>0)'
-                    '*A' + str(cren_start_row) + ':A' + str(cren_end_row) + ')'
+                    '=IFERROR(SUMPRODUCT((' + search_parts + '>0)'
+                    '*A' + str(cren_start_row) + ':A' + str(cren_end_row) + '),0)'
                 )
                 total_cell.value         = formula
                 total_cell.number_format = '0.00'
@@ -1228,11 +1193,7 @@ def write_planning_agent_week_sheet(wb, week_data, metadata, jour_cren_rows=None
 
         # ── Fusion cellules consécutives par colonne jour ──────
         # Couvre EARLY slots + SP créneaux + LATE slot
-        # Fusion par colonne jour avec ajout du créneau fusionné
-        if early_start_row < cren_end_row:
-            for jour in jours_presents:
-                col_j = col_map[jour]
-                _merge_and_time(ws, col_j, early_start_row, cren_end_row, pa_row_cren_map)
+        # Pas de fusion — 1 ligne = 1 créneau pour que les formules IF restent dynamiques
 
         # ── Séparateur ──────────────────────────────────────────
         for ci in range(1, nb_cols + 1):

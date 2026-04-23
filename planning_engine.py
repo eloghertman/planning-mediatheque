@@ -1638,6 +1638,157 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
             else:
                 vac_sp_obligatoire[ag] = []
 
+        # ══ PASSE 0 : remplacement par bloc ══════════════════════════════
+        # Pour chaque section, détecter les blocs de créneaux consécutifs
+        # où l'UNIQUE agent PT est absent, et pré-assigner UN seul remplaçant
+        # par bloc (option A : si personne ne couvre tout, on coupe le bloc).
+        # Résultat : bloc_repl[(cren_name, section)] = agent_remplaçant
+        # ────────────────────────────────────────────────────────────────
+
+        def _agent_in_pt_after_bloc(agent, bloc, section):
+            """True si l'agent est dans le PT dans la même section juste après le bloc."""
+            if not bloc:
+                return False
+            bloc_end_idx = bloc[-1][0]  # index du dernier créneau du bloc
+            # Vérifier les créneaux immédiatement après le bloc
+            for idx_after in range(bloc_end_idx + 1, len(creneaux)):
+                cn_after = creneaux[idx_after][0]
+                after_slot = base.get(cn_after, {})
+                ags_after = [normalize_agent_name(a) for a in after_slot.get(section, [])]
+                if agent in ags_after:
+                    return True
+                # Arrêter au premier créneau ouvert (même si vide)
+                cs_after, ce_after = creneaux[idx_after][1], creneaux[idx_after][2]
+                if creneau_is_open(cs_after, ce_after, jour, horaires_ouverture):
+                    break
+            return False
+
+        def _agent_in_pt_before_bloc(agent, bloc_start_idx):
+            """True si l'agent est dans le PT au créneau qui précède le bloc."""
+            if bloc_start_idx == 0:
+                return False
+            prev_cn = creneaux[bloc_start_idx - 1][0]
+            prev_slot = base.get(prev_cn, {})
+            for sect_p, ags_p in prev_slot.items():
+                if any(normalize_agent_name(a) == agent for a in ags_p):
+                    return True
+            return False
+
+        def _sp_before_bloc(agent, bloc_start_idx):
+            """SP déjà cumulé pour cet agent dans la journée avant le bloc."""
+            total = 0
+            for idx2 in range(bloc_start_idx):
+                cn2, cs2, ce2 = creneaux[idx2]
+                slot2 = day_assignments.get(cn2)
+                if slot2 and isinstance(slot2, dict):
+                    for _, ags2 in slot2.get('assignment', {}).items():
+                        if agent in ags2:
+                            total += ce2 - cs2
+            return total
+
+        def _find_best_for_bloc(section, bloc, committed):
+            """
+            Meilleur agent pour couvrir TOUT le bloc.
+            bloc = [(idx, cren_name, cs, ce), ...]
+            """
+            if not bloc:
+                return None
+            bloc_dur       = sum(ce - cs for _, _, cs, ce in bloc)
+            bloc_start_idx = bloc[0][0]
+            best = None; best_score = None
+
+            for agent in eligible:
+                if agent in committed:
+                    continue
+                if is_vacataire(agent) and section == 'RDC':
+                    continue
+                if section not in affectations.get(agent, []):
+                    continue
+                if is_vacataire(agent) and not is_vac_day:
+                    continue
+                # Dispo sur TOUS les créneaux
+                if not all(agent_available(agent, jour, cs_b, ce_b, date_str,
+                                            horaires_agents, evenements)
+                           for _, _, cs_b, ce_b in bloc):
+                    continue
+                # D14 pause méridienne (réguliers)
+                if not is_vacataire(agent):
+                    if not all(agent_has_meridienne_pause(agent, idx_b, creneaux,
+                                                          day_assignments, horaires_agents, jour)
+                               for idx_b, _, _, _ in bloc):
+                        continue
+                # D7/D8 durée totale du bloc
+                sp_bef = _sp_before_bloc(agent, bloc_start_idx)
+                if sp_bef + bloc_dur > max_long:
+                    continue
+
+                rouge   = 1 if is_section_rouge(agent, section, affectations, categories) else 0
+                prim    = 0 if (affectations.get(agent, [''])[0] == section) else 1
+                vac_ord = 0 if not is_vacataire(agent) else (1 if '1' in agent else 2)
+                adj_pen   = 1 if _agent_in_pt_before_bloc(agent, bloc_start_idx) else 0
+                adj_after = 1 if _agent_in_pt_after_bloc(agent, bloc, section) else 0
+                resp    = (1 if (responsables and agent in responsables
+                                 and not is_vacataire(agent)) else 0)
+                sp_sem  = sp_count.get(agent, 0)
+                score   = (rouge, prim, vac_ord, adj_pen, adj_after, resp, sp_sem, sp_bef, agent)
+                if best_score is None or score < best_score:
+                    best_score = score; best = agent
+            return best
+
+        def _assign_bloc_repl(section, bloc, committed):
+            """Assigne récursivement des remplaçants au bloc (option A : découpe si besoin)."""
+            if not bloc:
+                return
+            # Chercher le plus long préfixe couvrable
+            best_agent = None; best_len = 0
+            for length in range(len(bloc), 0, -1):
+                ag = _find_best_for_bloc(section, bloc[:length], committed)
+                if ag is not None:
+                    best_agent = ag; best_len = length; break
+            if best_agent is None:
+                return  # laisse Passe A/B gérer
+            for _, cren_name_b, _, _ in bloc[:best_len]:
+                bloc_repl[(cren_name_b, section)] = best_agent
+            _assign_bloc_repl(section, bloc[best_len:], committed | {best_agent})
+
+        bloc_repl = {}
+
+        for section in SECTIONS:
+            current_bloc = []
+            current_pt_absent = None
+            for cren_idx_b, (cren_name_b, cs_b, ce_b) in enumerate(creneaux):
+                if not creneau_is_open(cs_b, ce_b, jour, horaires_ouverture):
+                    if current_bloc:
+                        _assign_bloc_repl(section, current_bloc, set())
+                    current_bloc = []; current_pt_absent = None
+                    continue
+                pt_agents_b = [normalize_agent_name(a)
+                               for a in base.get(cren_name_b, {}).get(section, [])]
+                if len(pt_agents_b) == 1:
+                    ag_pt = pt_agents_b[0]
+                    absent = not agent_available(ag_pt, jour, cs_b, ce_b,
+                                                  date_str, horaires_agents, evenements)
+                    if absent:
+                        if ag_pt == current_pt_absent:
+                            current_bloc.append((cren_idx_b, cren_name_b, cs_b, ce_b))
+                        else:
+                            if current_bloc:
+                                _assign_bloc_repl(section, current_bloc, set())
+                            current_pt_absent = ag_pt
+                            current_bloc = [(cren_idx_b, cren_name_b, cs_b, ce_b)]
+                    else:
+                        if current_bloc:
+                            _assign_bloc_repl(section, current_bloc, set())
+                        current_bloc = []; current_pt_absent = None
+                else:
+                    if current_bloc:
+                        _assign_bloc_repl(section, current_bloc, set())
+                    current_bloc = []; current_pt_absent = None
+            if current_bloc:
+                _assign_bloc_repl(section, current_bloc, set())
+
+        # ══ FIN PASSE 0 ═══════════════════════════════════════════════
+
         for cren_idx, (cren_name, cs, ce) in enumerate(creneaux):
             slot_min = ce - cs
 
@@ -1697,36 +1848,40 @@ def plan_week(week_num, week_dates, planning_type_base, samedi_type,
                         final.append(agent_resolved)
                         assigned_this.add(agent_resolved)
                     else:
-                        # Si Jeunesse a besoin d'un vacataire exclusivement,
-                        # ne pas consommer les vacataires pour RDC/Adulte/MF
-                        _excl_passe_a = _jeunesse_vac_exclude(
-                            section, j_needs, eligible, assigned_this,
-                            jour, cs, ce, date_str, affectations,
-                            horaires_agents, evenements, pt_slot=base_slot)
-                        repl, oos = find_replacement(
-                            section=section, jour=jour, cs=cs, ce=ce,
-                            date_str=date_str, eligible=eligible,
-                            affectations=affectations,
-                            categories=categories,
-                            horaires_agents=horaires_agents,
-                            evenements=evenements,
-                            sp_count=sp_count, sp_max_min=sp_max_min,
-                            sp_week_count=dict(sp_count),
-                            creneaux=creneaux, cren_idx=cren_idx,
-                            day_assignments=day_assignments,
-                            max_court=max_court, max_long=max_long,
-                            exclude=_excl_passe_a,
-                            vac_day_sp=vac_day_sp,
-                            force_vacataire=False,
-                            vac_prioritaire=False,
-                            vac_section_jour=vac_section_jour,
-                            planning_type_base=planning_type_base,
-                            pt_key=pt_key,
-                            responsables=responsables,
-                        )
-                        if repl:
-                            final.append(repl)
-                            assigned_this.add(repl)
+                        # Passe 0 : remplaçant pré-calculé par bloc ?
+                        repl_bloc = bloc_repl.get((cren_name, section))
+                        if repl_bloc and repl_bloc not in assigned_this:
+                            final.append(repl_bloc)
+                            assigned_this.add(repl_bloc)
+                        else:
+                            _excl_passe_a = _jeunesse_vac_exclude(
+                                section, j_needs, eligible, assigned_this,
+                                jour, cs, ce, date_str, affectations,
+                                horaires_agents, evenements, pt_slot=base_slot)
+                            repl, oos = find_replacement(
+                                section=section, jour=jour, cs=cs, ce=ce,
+                                date_str=date_str, eligible=eligible,
+                                affectations=affectations,
+                                categories=categories,
+                                horaires_agents=horaires_agents,
+                                evenements=evenements,
+                                sp_count=sp_count, sp_max_min=sp_max_min,
+                                sp_week_count=dict(sp_count),
+                                creneaux=creneaux, cren_idx=cren_idx,
+                                day_assignments=day_assignments,
+                                max_court=max_court, max_long=max_long,
+                                exclude=_excl_passe_a,
+                                vac_day_sp=vac_day_sp,
+                                force_vacataire=False,
+                                vac_prioritaire=False,
+                                vac_section_jour=vac_section_jour,
+                                planning_type_base=planning_type_base,
+                                pt_key=pt_key,
+                                responsables=responsables,
+                            )
+                            if repl:
+                                final.append(repl)
+                                assigned_this.add(repl)
 
                 assignment[section] = final
 
