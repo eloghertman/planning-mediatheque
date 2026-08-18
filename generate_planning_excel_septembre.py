@@ -563,14 +563,17 @@ def verrouiller_cellules_formules(wb):
         ws.protection.autoFilter = False
 
 
-def generer():
-    raw = load_excel_data(INPUT_PREP)
+def generer(input_path=None, output_path=None):
+    input_path = input_path or INPUT_PREP
+    output_path = output_path or OUTPUT_PATH
+
+    raw = load_excel_data(input_path)
     jours_speciaux = parse_jours_speciaux(raw)
     params_mois = parse_parametres(raw)
     evenements = parse_evenements(raw, annee_defaut=params_mois.get('annee'))
     hor_ouv = parse_horaires_ouverture(raw)
 
-    weeks_data, metadata = compute_full_planning(INPUT_PREP)
+    weeks_data, metadata = compute_full_planning(input_path)
 
     # Liste des agents pour le récap heures : tous les agents habilités
     # (réguliers + vacataires, dans l'ordre du fichier Affectations), hors
@@ -603,16 +606,18 @@ def generer():
         last_date = jours[-1]['date']
         d1 = int(first_date[-2:])
         d2 = int(last_date[-2:])
+        a1 = int(first_date[:4])
+        a2 = int(last_date[:4])
         mois_jour_fr = {1:'Janvier',2:'Février',3:'Mars',4:'Avril',5:'Mai',6:'Juin',
                          7:'Juillet',8:'Août',9:'Septembre',10:'Octobre',
                          11:'Novembre',12:'Décembre'}
         m1 = mois_jour_fr[int(first_date[5:7])]
         m2 = mois_jour_fr[int(last_date[5:7])]
         periode_txt = metadata.get('periode_semaine', {}).get(week_num, '')
-        if m1 == m2:
-            titre = f'PLANNING SP — Semaine {week_num}  |  {d1} au {d2} {m1} 2026'
+        if m1 == m2 and a1 == a2:
+            titre = f'PLANNING SP — Semaine {week_num}  |  {d1} au {d2} {m1} {a1}'
         else:
-            titre = f'PLANNING SP — Semaine {week_num}  |  {d1} {m1} au {d2} {m2} 2026'
+            titre = f'PLANNING SP — Semaine {week_num}  |  {d1} {m1} {a1} au {d2} {m2} {a2}'
         ws.merge_cells('A1:J1')
         c = ws.cell(row=1, column=1, value=titre)
         c.fill = PatternFill('solid', fgColor=COL_TITLE_FILL)
@@ -638,7 +643,8 @@ def generer():
             mois_jour_fr = {1:'Janvier',2:'Février',3:'Mars',4:'Avril',5:'Mai',6:'Juin',
                              7:'Juillet',8:'Août',9:'Septembre',10:'Octobre',
                              11:'Novembre',12:'Décembre'}[int(date_str[5:7])]
-            libelle_jour = f'  {jour.upper()}  {dnum} {mois_jour_fr} 2026'
+            annee_jour = int(date_str[:4])
+            libelle_jour = f'  {jour.upper()}  {dnum} {mois_jour_fr} {annee_jour}'
             if sam_type:
                 libelle_jour += f'  —  SAMEDI {sam_type}'
             if est_ferie:
@@ -871,8 +877,9 @@ def generer():
                            horaires_agents, pause_flex, evenements)
 
     verrouiller_cellules_formules(wb)
-    wb.save(OUTPUT_PATH)
-    print('Fichier genere:', OUTPUT_PATH)
+    wb.save(output_path)
+    print('Fichier genere:', output_path)
+    return output_path, weeks_data, metadata
 
 
 def grille_fine_commune(jours):
