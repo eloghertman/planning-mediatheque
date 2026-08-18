@@ -231,12 +231,14 @@ def parse_conges(path, mois, annee):
 # ══════════════════════════════════════════════════════════════
 
 def parse_accueil_creche(path, mois, annee):
-    """A1 = heure (ex: '10h-11h'), colonne A = mois, colonne B = jour
-    ('jeudi 7'), colonne C = nom de la crèche (événement seulement si
-    rempli). Ce sont des visites en créneaux libres : AUCUN agent n'est
-    jamais affecté à cet événement (validé avec Elo le [session accueil
-    libre]). On ne surligne donc jamais l'absence d'agent — c'est l'état
-    normal. Seule une heure introuvable en A1 déclenche une alerte."""
+    """A1 = heure (ex: '10h -10h30'), colonne A = mois (rempli une seule fois
+    par bloc), colonne B = jour ('jeudi 7' — cellule fusionnée sur plusieurs
+    lignes quand plusieurs crèches viennent le même jour), colonne C = nom de
+    la crèche (une ligne par crèche ; un jour peut avoir 0, 1 ou plusieurs
+    crèches). Ce sont des visites en créneaux libres : AUCUN agent n'est
+    jamais affecté à cet événement. On ne surligne donc jamais l'absence
+    d'agent — c'est l'état normal. Seule une heure introuvable en A1
+    déclenche une alerte."""
     wb = load_workbook(path, data_only=True)
     ws = wb[wb.sheetnames[0]]
 
@@ -246,24 +248,23 @@ def parse_accueil_creche(path, mois, annee):
 
     events = []
     current_month_label = None
+    current_day = None
     for r in range(2, ws.max_row + 1):
         a = ws.cell(row=r, column=1).value
         b = ws.cell(row=r, column=2).value
         c = ws.cell(row=r, column=3).value
         if a:
             current_month_label = str(a).strip().lower()
-        if not current_month_label or current_month_label != MOIS_FR[mois]:
-            continue
-        if not b:
-            continue
-        m = re.search(r'(\d+)', str(b))
-        if not m:
-            continue
+            current_day = None
+        if b:
+            m = re.search(r'(\d+)', str(b))
+            current_day = int(m.group(1)) if m else None
         if not c:
-            continue  # pas de crèche indiquée → pas d'accueil ce jour-là
-        day_num = int(m.group(1))
+            continue  # pas de crèche indiquée sur cette ligne → pas d'accueil
+        if current_month_label != MOIS_FR[mois] or current_day is None:
+            continue
         try:
-            d = date(annee, mois, day_num)
+            d = date(annee, mois, current_day)
         except ValueError:
             continue
         events.append(_event(
@@ -292,50 +293,80 @@ def _est_visite_libre(*valeurs):
     return False
 
 
-def parse_accueil_classe(path, mois, annee):
-    """Colonne A = date, colonne B = initiales de l'intervenant, colonne D =
-    créneau horaire ('10h-11h' / '14H-15H'), colonne E = nom de l'école
-    (événement seulement si rempli).
+def _jour_si_mois_cible(texte_date, mois_cible):
+    """Le fichier accueil de classe écrit la date en texte, sans année
+    ('mardi 3 novembre', parfois 'jeudi 22 (vacances)'). On ne connaît pas
+    l'année à partir du texte seul : on se contente de vérifier que le nom
+    du mois demandé apparaît dans le texte, et on renvoie le numéro du jour
+    si c'est le cas (sinon None — ligne d'un autre mois, ou pas une date)."""
+    if not texte_date:
+        return None
+    s = str(texte_date).strip().lower()
+    m = re.search(r'(\d{1,2})', s)
+    if not m:
+        return None
+    if MOIS_FR[mois_cible] not in s:
+        return None
+    return int(m.group(1))
 
-    Cas particulier "visite libre" : si la colonne B ou E porte la mention
+
+def parse_accueil_classe(path, mois, annee):
+    """Colonne A = initiales de l'intervenant, colonne B = date en texte
+    ('mardi 3 novembre' — remplie seulement sur la 1re ligne du jour, les
+    lignes suivantes du même jour ont la colonne B vide), colonne D =
+    créneau horaire ('10h-11h' / '14H-15H'), colonne E = nom de l'école
+    (événement seulement si rempli). Le fichier empile plusieurs mois à la
+    suite (blocs 'NOVEMBRE', 'DECEMBRE'...), d'où le filtrage par nom de
+    mois dans le texte plutôt que par position dans le fichier.
+
+    Cas particulier "visite libre" : si la colonne A ou E porte la mention
     'uniquement en visite libre' (ou une variante contenant 'visite libre'),
     aucun agent n'est affecté et aucune alerte n'est levée — c'est l'état
     normal pour ce type de visite. L'événement est alors nommé
     'Accueil libre école'. Sinon, comportement inchangé : l'agent vient des
-    initiales en colonne B, et son absence déclenche une alerte."""
+    initiales en colonne A, et son absence déclenche une alerte."""
     wb = load_workbook(path, data_only=True)
     ws = wb[wb.sheetnames[0]]
 
     events = []
+    current_date = None
     for r in range(1, ws.max_row + 1):
-        a = ws.cell(row=r, column=1).value
-        if not isinstance(a, datetime):
-            continue
-        if not (a.year == annee and a.month == mois):
-            continue
-        e_ecole = ws.cell(row=r, column=5).value
-        if not e_ecole or not str(e_ecole).strip():
-            continue  # pas d'école indiquée -> pas d'événement cette ligne
-        b_init = ws.cell(row=r, column=2).value
+        a_init = ws.cell(row=r, column=1).value
+        b_date = ws.cell(row=r, column=2).value
         d_heure = ws.cell(row=r, column=4).value
+        e_ecole = ws.cell(row=r, column=5).value
+
+        if b_date:
+            jour = _jour_si_mois_cible(b_date, mois)
+            if jour:
+                try:
+                    current_date = date(annee, mois, jour)
+                except ValueError:
+                    current_date = None
+            else:
+                current_date = None  # ligne d'un autre mois : on ne reporte pas sa date
+
+        if not e_ecole or not str(e_ecole).strip() or current_date is None:
+            continue  # pas d'école indiquée, ou pas dans le mois demandé
+
         debut, fin = parse_heure_range(d_heure)
 
-        if _est_visite_libre(b_init, e_ecole):
+        if _est_visite_libre(a_init, e_ecole):
             events.append(_event(
-                a.date(), debut, fin, 'Accueil libre école', [],
+                current_date, debut, fin, 'Accueil libre école', [],
                 alert=False,
                 source='accueil de classe',
             ))
             continue
 
         agent = None
-        if b_init:
-            agent = INITIALES_ACCUEIL_CLASSE.get(str(b_init).strip().upper())
+        if a_init:
+            agent = INITIALES_ACCUEIL_CLASSE.get(str(a_init).strip().upper())
             agent = normalize_agent(agent) if agent else None
 
         alert = agent is None
         events.append(_event(
-            a.date(), debut, fin, 'Accueil classe', [agent] if agent else [],
+            current_date, debut, fin, 'Accueil classe', [agent] if agent else [],
             alert=alert,
             alert_reason="Intervenant non précisé dans le fichier source." if alert else None,
             source='accueil de classe',
