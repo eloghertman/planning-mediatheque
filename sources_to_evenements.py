@@ -380,11 +380,12 @@ def parse_accueil_classe(path, mois, annee):
 # ══════════════════════════════════════════════════════════════
 
 def parse_lecture_jeudi_matin(path, mois, annee):
-    """A1 = heure fixe ('10h-10h30'). Une 'séance' occupe plusieurs lignes
-    (une ligne par enfant), la colonne B ne portant la date + le code groupe
-    ('06/11/2025 IM Gp 1') que sur la 1re ligne de la séance. La ligne
-    'Total' de chaque séance porte l'intervenant(e) en colonne I. Nom de
-    l'événement toujours 'lectures AM/AP' (fixe, validé avec Elo)."""
+    """A1 = heure fixe ('10h-10h30'). Une séance occupe un bloc de lignes
+    fusionnées (une ligne par enfant en-dessous, non utilisée ici) : seule
+    la 1re ligne du bloc porte une vraie date (colonne B, en tant que date
+    Excel, année comprise) et les intervenant(e)s (colonne J, plusieurs noms
+    séparés par ';'). Nom de l'événement : 'Lectures AssMat/AssPar'
+    (validé avec Elo)."""
     wb = load_workbook(path, data_only=True)
     ws = wb[wb.sheetnames[0]]
 
@@ -392,31 +393,26 @@ def parse_lecture_jeudi_matin(path, mois, annee):
     debut, fin = parse_heure_range(heure_raw)
 
     events = []
-    current_date = None
     for r in range(2, ws.max_row + 1):
         b = ws.cell(row=r, column=2).value
-        c = ws.cell(row=r, column=3).value
-        i_val = ws.cell(row=r, column=9).value
+        if not isinstance(b, datetime):
+            continue
+        if not (b.year == annee and b.month == mois):
+            continue
 
-        if b:
-            m = re.search(r'(\d{2}/\d{2}/\d{4})', str(b))
-            current_date = datetime.strptime(m.group(1), '%d/%m/%Y').date() if m else None
+        j_val = ws.cell(row=r, column=10).value
+        if j_val:
+            agents = [normalize_agent(a) or a.strip() for a in str(j_val).split(';') if a.strip()]
+        else:
+            agents = []
 
-        if c and str(c).strip().lower() == 'total':
-            if current_date and current_date.year == annee and current_date.month == mois:
-                agents = detect_agents_in_text(i_val)
-                alert = len(agents) == 0
-                if alert:
-                    reason = (f"Contenu non reconnu comme un nom d'agent : « {i_val} » "
-                              f"(peut-être une séance annulée : à vérifier)."
-                              if i_val else "Intervenant non renseigné dans le fichier source.")
-                else:
-                    reason = None
-                events.append(_event(
-                    current_date, debut, fin, 'lectures AM/AP', agents,
-                    alert=alert, alert_reason=reason, source='lecture jeudi matin',
-                ))
-            current_date = None  # une séance = une ligne Total, on repart à zéro
+        alert = len(agents) == 0
+        events.append(_event(
+            b.date(), debut, fin, 'Lectures AssMat/AssPar', agents,
+            alert=alert,
+            alert_reason="Intervenant non renseigné dans le fichier source." if alert else None,
+            source='lecture jeudi matin',
+        ))
     return events
 
 
@@ -455,8 +451,17 @@ def parse_calendrier_evenements(path, sheet_name):
 
 def build_onglet_evenements(events, out_path, sheet_name='Événements'):
     """Écrit un classeur Excel avec un onglet Événements dans le format
-    attendu par planning_engine.parse_evenements. Les événements incomplets
-    (alert=True) sont surlignés en jaune avec un commentaire explicatif."""
+    attendu par planning_engine.parse_evenements.
+
+    Règle de surlignage (colonne Agents) : si la colonne Agents est vide ou
+    contient un texte qui n'est manifestement pas un prénom ('à déterminer',
+    '?', 'à définir'...), toute la ligne est surlignée en jaune avec un
+    commentaire — SAUF si l'intitulé de l'événement contient 'libre'
+    (Accueil libre crèche, Accueil libre école...), où l'absence d'agent est
+    normale et n'est jamais signalée.
+
+    Les autres cas incomplets détectés par les parseurs (ev['alert'], par
+    exemple une heure introuvable) restent surlignés comme avant."""
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_name
@@ -474,6 +479,11 @@ def build_onglet_evenements(events, out_path, sheet_name='Événements'):
         return (date.max, '')
     events_sorted = sorted(events, key=_sort_key)
 
+    PLACEHOLDERS_AGENT = {
+        '', '?', 'à déterminer', 'a déterminer', 'à determiner', 'a determiner',
+        'à définir', 'a définir', 'à definir', 'a definir',
+    }
+
     row = 2
     n_alerts = 0
     for ev in events_sorted:
@@ -486,15 +496,26 @@ def build_onglet_evenements(events, out_path, sheet_name='Événements'):
         ws.cell(row=row, column=4, value=ev['nom'])
         ws.cell(row=row, column=5, value=agents_str)
 
-        if ev.get('alert'):
+        nom_low = (ev['nom'] or '').lower()
+        est_libre = 'libre' in nom_low
+        agent_placeholder = agents_str.strip().lower() in PLACEHOLDERS_AGENT
+
+        if agent_placeholder and not est_libre:
+            n_alerts += 1
+            reason = (ev.get('alert_reason') if ev.get('alert') else None) or (
+                "Agent non renseigné (vide, « à déterminer », « ? » ou "
+                "« à définir ») — à compléter."
+            )
+            for col in range(1, 6):
+                ws.cell(row=row, column=col).fill = JAUNE
+            ws.cell(row=row, column=5).comment = Comment(reason, "Assistant planning")
+        elif ev.get('alert'):
             n_alerts += 1
             reason = ev.get('alert_reason') or 'À compléter.'
-            # Heure manquante -> on surligne Début/Fin ; agent manquant -> Agents
+            # Heure manquante -> on surligne Début/Fin
             cells_to_flag = []
             if not ev['debut'] and not ev['fin']:
                 cells_to_flag = [2, 3]
-            if not ev['agents']:
-                cells_to_flag.append(5)
             if not cells_to_flag:
                 cells_to_flag = [5]
             for col in cells_to_flag:
