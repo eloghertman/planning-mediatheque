@@ -471,12 +471,25 @@ def build_onglet_evenements(events, out_path, sheet_name='Événements'):
     for c in range(1, 6):
         ws.cell(row=1, column=c).font = Font(bold=True)
 
-    # Tri chronologique pour une lecture confortable
+    # Tri chronologique pour une lecture confortable. Attention : trier
+    # directement le texte de l'heure ('10h' vs '9h') donnerait un ordre
+    # alphabétique erroné (9h après 10h) — on convertit donc l'heure de
+    # début en nombre de minutes avant de comparer.
+    def _heure_en_minutes(h):
+        if not h:
+            return 99999  # heure inconnue -> classée en dernier ce jour-là
+        m = re.match(r'(\d{1,2})h(\d{2})?', str(h).strip().lower())
+        if not m:
+            return 99999
+        heures = int(m.group(1))
+        minutes = int(m.group(2)) if m.group(2) else 0
+        return heures * 60 + minutes
+
     def _sort_key(ev):
         d = ev['date']
         if isinstance(d, date):
-            return (d, ev.get('debut') or '')
-        return (date.max, '')
+            return (d, _heure_en_minutes(ev.get('debut')))
+        return (date.max, 99999)
     events_sorted = sorted(events, key=_sort_key)
 
     PLACEHOLDERS_AGENT = {
