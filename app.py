@@ -22,6 +22,7 @@ import tempfile
 import streamlit as st
 
 from sources_to_evenements import generate_evenements, MOIS_FR_CAP
+from generate_planning_excel_septembre import generer
 
 st.set_page_config(page_title="Planning Médiathèque", page_icon="📅", layout="centered")
 
@@ -29,6 +30,33 @@ st.set_page_config(page_title="Planning Médiathèque", page_icon="📅", layout
 # ══════════════════════════════════════════════════════════════
 #  OUTILS
 # ══════════════════════════════════════════════════════════════
+
+def _fusionner_evenements_dans_preparation(prep_path, evenements_path, out_path):
+    """Copie l'onglet Événements du fichier généré au bloc 1 dans le fichier
+    de Préparation mensuelle (en remplaçant l'onglet existant s'il y en a
+    déjà un), pour obtenir un seul fichier combiné à donner au moteur de
+    calcul — qui, lui, n'accepte qu'un seul fichier en entrée."""
+    import openpyxl as _openpyxl
+    wb_prep = _openpyxl.load_workbook(prep_path)
+    wb_evt = _openpyxl.load_workbook(evenements_path, data_only=True)
+
+    if 'Événements' in wb_evt.sheetnames:
+        src_name = 'Événements'
+    elif 'Evenements' in wb_evt.sheetnames:
+        src_name = 'Evenements'
+    else:
+        src_name = wb_evt.sheetnames[0]
+    ws_src = wb_evt[src_name]
+
+    for name in ('Événements', 'Evenements'):
+        if name in wb_prep.sheetnames:
+            del wb_prep[name]
+    ws_dst = wb_prep.create_sheet('Événements')
+    for row in ws_src.iter_rows(values_only=True):
+        ws_dst.append(row)
+
+    wb_prep.save(out_path)
+    return out_path
 
 def _save_uploaded(uploaded_file, tmp_dir):
     """Enregistre un fichier uploadé par Streamlit sur le disque (les
@@ -232,16 +260,85 @@ st.divider()
 
 st.header("2. Générer le planning mensuel")
 st.markdown(
-    "**Ce que fera ce bloc :** tu déposeras ici deux fichiers — le fichier "
+    "**Ce que fait ce bloc :** dépose ici deux fichiers — le fichier "
     "Événements (celui généré au bloc 1, ou un ancien si tu le réutilises) "
-    "et le fichier de Préparation mensuelle. L'app calculera le planning "
-    "complet du mois et te le rendra en Excel, prêt à imprimer, avec les "
-    "créneaux impossibles à couvrir clairement signalés."
+    "et le fichier de Préparation mensuelle. L'app les combine, calcule le "
+    "planning complet du mois et te le rend en Excel, prêt à imprimer. "
+    "S'il reste des créneaux impossibles à couvrir malgré le calcul, ils "
+    "sont listés clairement ci-dessous, en plus d'être signalés dans le "
+    "fichier lui-même."
 )
-st.info("🚧 Ce bloc arrive à l'étape suivante, une fois le bloc 1 validé.")
-st.file_uploader("Fichier Événements", disabled=True, key="stub_evenements")
-st.file_uploader("Fichier Préparation mensuelle", disabled=True, key="stub_preparation")
-st.button("Générer le planning", disabled=True, key="stub_generer")
+
+with st.form("form_planning"):
+    f_evenements_b2 = st.file_uploader(
+        "Fichier Événements", type=["xlsx"], key="f_evenements_b2"
+    )
+    f_preparation_b2 = st.file_uploader(
+        "Fichier Préparation mensuelle", type=["xlsx"], key="f_preparation_b2"
+    )
+    submitted_b2 = st.form_submit_button("Générer le planning", type="primary")
+
+if submitted_b2:
+    if not f_preparation_b2:
+        st.warning("Le fichier de Préparation mensuelle est obligatoire.")
+    else:
+        with st.spinner(
+            "Calcul du planning en cours — ça peut prendre une à quelques "
+            "minutes selon la taille du mois, merci de patienter…"
+        ):
+            tmp_dir = tempfile.mkdtemp()
+            try:
+                p_prep = _save_uploaded(f_preparation_b2, tmp_dir)
+
+                if f_evenements_b2:
+                    p_evt = _save_uploaded(f_evenements_b2, tmp_dir)
+                    p_fusionne = os.path.join(tmp_dir, "Preparation_fusionnee.xlsx")
+                    _fusionner_evenements_dans_preparation(p_prep, p_evt, p_fusionne)
+                    input_path = p_fusionne
+                else:
+                    input_path = p_prep
+
+                output_path = os.path.join(tmp_dir, "Planning_genere.xlsx")
+                output_path, weeks_data, metadata = generer(input_path, output_path)
+
+            except Exception as e:
+                st.error(
+                    "Le calcul n'a pas pu aboutir. Vérifie que le fichier de "
+                    "Préparation a bien tous ses onglets (Affectations, "
+                    "Horaires_Des_Agents, Paramètres, Planning_type...) et "
+                    "qu'il n'a pas été modifié dans sa structure.\n\n"
+                    f"Détail technique : {e}"
+                )
+                st.stop()
+
+        # ── Résumé des alertes à l'écran ──
+        alertes_par_jour = []
+        for w in weeks_data:
+            for j in w["jours"]:
+                if j.get("alertes"):
+                    alertes_par_jour.append((j["date"], j["alertes"]))
+
+        if alertes_par_jour:
+            st.warning(
+                f"⚠️ {sum(len(a) for _, a in alertes_par_jour)} créneau(x) "
+                "n'ont pas pu être entièrement couverts — à traiter à la main."
+            )
+            for date_str, alertes in alertes_par_jour:
+                for cren_idx, section, message in alertes:
+                    st.markdown(f"- **{date_str}** — {section} : {message}")
+        else:
+            st.success("Aucune alerte : tous les créneaux ont été couverts.")
+
+        with open(output_path, "rb") as f:
+            file_bytes = f.read()
+
+        st.download_button(
+            "⬇️ Télécharger le planning généré",
+            data=file_bytes,
+            file_name="Planning_genere.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_planning",
+        )
 
 st.divider()
 
