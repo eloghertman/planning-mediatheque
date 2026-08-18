@@ -319,10 +319,10 @@ def parse_accueil_classe(path, mois, annee):
     suite (blocs 'NOVEMBRE', 'DECEMBRE'...), d'où le filtrage par nom de
     mois dans le texte plutôt que par position dans le fichier.
 
-    Cas particulier "visite libre" : si la colonne A ou E porte la mention
-    'uniquement en visite libre' (ou une variante contenant 'visite libre'),
-    aucun agent n'est affecté et aucune alerte n'est levée — c'est l'état
-    normal pour ce type de visite. L'événement est alors nommé
+    Cas particulier "visite libre" : si la colonne A, E, ou J porte la
+    mention 'uniquement en visite libre' (ou une variante contenant 'visite
+    libre'), aucun agent n'est affecté et aucune alerte n'est levée — c'est
+    l'état normal pour ce type de visite. L'événement est alors nommé
     'Accueil libre école'. Sinon, comportement inchangé : l'agent vient des
     initiales en colonne A, et son absence déclenche une alerte."""
     wb = load_workbook(path, data_only=True)
@@ -335,6 +335,7 @@ def parse_accueil_classe(path, mois, annee):
         b_date = ws.cell(row=r, column=2).value
         d_heure = ws.cell(row=r, column=4).value
         e_ecole = ws.cell(row=r, column=5).value
+        j_note = ws.cell(row=r, column=10).value
 
         if b_date:
             jour = _jour_si_mois_cible(b_date, mois)
@@ -351,7 +352,7 @@ def parse_accueil_classe(path, mois, annee):
 
         debut, fin = parse_heure_range(d_heure)
 
-        if _est_visite_libre(a_init, e_ecole):
+        if _est_visite_libre(a_init, e_ecole, j_note):
             events.append(_event(
                 current_date, debut, fin, 'Accueil libre école', [],
                 alert=False,
