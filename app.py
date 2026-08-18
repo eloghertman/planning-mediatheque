@@ -329,13 +329,21 @@ if submitted_b2:
         else:
             st.success("Aucune alerte : tous les créneaux ont été couverts.")
 
+        # ── Nom de fichier dynamique : Planning_MoisAnnée.xlsx, déduit de la
+        # première date réellement présente dans le planning calculé ──
+        premiere_date = weeks_data[0]["jours"][0]["date"]  # 'YYYY-MM-DD'
+        annee_planning = premiere_date[:4]
+        mois_num_planning = int(premiere_date[5:7])
+        mois_nom_planning = MOIS_FR_CAP[mois_num_planning]
+        nom_fichier_final = f"Planning_{mois_nom_planning}{annee_planning}.xlsx"
+
         with open(output_path, "rb") as f:
             file_bytes = f.read()
 
         st.download_button(
             "⬇️ Télécharger le planning généré",
             data=file_bytes,
-            file_name="Planning_genere.xlsx",
+            file_name=nom_fichier_final,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_planning",
         )
