@@ -559,7 +559,15 @@ def parse_planning_type(raw):
         result[cur_jour][cren_str]['RDC']      = get_agents(row[1] if len(row) > 1 else None)
         result[cur_jour][cren_str]['Adulte']   = get_agents(row[2] if len(row) > 2 else None)
         result[cur_jour][cren_str]['MF']       = get_agents(row[3] if len(row) > 3 else None)
-        result[cur_jour][cren_str]['Jeunesse'] = get_agents(row[4] if len(row) > 4 else None)
+        # Jeunesse : 3 colonnes séparées (E, F, G — une par agent), comme
+        # partout ailleurs dans le projet — PAS une seule cellule avec des
+        # noms séparés par '/'. Corrigé 08/2026 : l'ancien code ne lisait
+        # que la colonne E et perdait silencieusement les agents des
+        # colonnes F et G quand le PT en prévoyait 2 ou 3.
+        jeunesse_agents = []
+        for col_idx in (4, 5, 6):
+            jeunesse_agents.extend(get_agents(row[col_idx] if len(row) > col_idx else None))
+        result[cur_jour][cren_str]['Jeunesse'] = jeunesse_agents
 
     return result
 
