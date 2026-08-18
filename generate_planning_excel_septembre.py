@@ -1010,7 +1010,36 @@ def generer_vue_agent(wb, week_num, jours, row_lookup, agents_recap,
     # utilisatrice : jamais de prénom dans la vue par agent, ni le sien ni
     # ceux des autres, juste le nom de l'événement + son horaire exact si
     # besoin).
+    # ⚠️ EVENTS_SRC_COLS n'est plus utilisé pour la DÉTECTION (cf. correctif
+    # ci-dessous : la détection se fait maintenant en Python, sur l'horaire
+    # réel de l'événement, pas sur le gros bloc fusionné du planning
+    # principal — voir _evenement_pour_agent_creneau). Gardé uniquement pour
+    # mémoire de la correspondance de colonnes.
     EVENTS_SRC_COLS = [('R', 'T'), ('S', 'U')]
+
+    date_par_jour = {j['jour']: j['date'] for j in jours}
+
+    def _evenement_pour_agent_creneau(agent, jour, cs, ce):
+        """Cherche un événement (hors congé) où CET agent est concerné et
+        dont l'horaire RÉEL (ev['cs']/ev['ce']) chevauche ce créneau fin
+        précis — corrige le bug où un événement plus court que le gros bloc
+        fusionné du planning principal (ex: accueil de classe 10h-11h dans
+        un bloc 10h-12h30) se retrouvait affiché sur tout le bloc dans la
+        vue par agent, et où un événement démarrant avant l'ouverture (ex:
+        portage 9h-12h) n'apparaissait qu'à partir de l'heure d'ouverture."""
+        date_str = date_par_jour.get(jour)
+        if date_str is None:
+            return None
+        for ev in evenements:
+            if ev['date'] != date_str:
+                continue
+            if ev['nom'].strip().lower() == 'congé':
+                continue  # déjà géré séparément par _en_conge
+            if agent not in ev.get('agents', []):
+                continue
+            if cs < ev['ce'] and ce > ev['cs']:  # chevauchement réel
+                return ev
+        return None
 
     # ── Congés par agent/jour : {(agent, jour): [(cs, ce), ...]} ────────
     # Un créneau qui chevauche un de ces intervalles est grisé "Congé",
@@ -1083,6 +1112,22 @@ def generer_vue_agent(wb, week_num, jours, row_lookup, agents_recap,
                     cell.fill = CONGE_FILL
                     continue
 
+                ev_ici = _evenement_pour_agent_creneau(agent, jour, cs, ce)
+                if ev_ici:
+                    # Événement réel (accueil, portage, réunion...) chevauchant
+                    # CE créneau fin précis — écrit en valeur littérale (pas en
+                    # formule) car basé sur l'horaire réel de l'événement, pas
+                    # sur le gros bloc fusionné du planning principal. Prend le
+                    # pas sur la case "travaillé"/RDC/Adulte/etc. habituelle,
+                    # y compris hors des horaires d'ouverture (ex: portage
+                    # avant l'ouverture) — corrige le double bug signalé
+                    # 09/2026 (durée d'événement dupliquée sur tout le bloc, et
+                    # événement avant ouverture invisible).
+                    cell.value = label_evenement_sans_noms(ev_ici, cs, ce)
+                    cell.font = Font(size=9, color='FF' + texte_agent, bold=True)
+                    cell.fill = PatternFill('solid', fgColor=fond_agent)
+                    continue
+
                 label_ad = _arrivee_depart_label(agent, jour, cs, ce, horaires_agents)
                 if label_ad:
                     # Arrivée/départ en plein milieu du créneau — prioritaire
@@ -1125,13 +1170,11 @@ def generer_vue_agent(wb, week_num, jours, row_lookup, agents_recap,
 
                 agent_q = agent.replace('"', '""')
                 inner = '""'
-                for detect_col, display_col in reversed(EVENTS_SRC_COLS):
-                    # Détection sur la colonne "complète" (R/S, avec prénoms),
-                    # affichage de la colonne "sans prénom" (T/U) — jamais de
-                    # prénom montré, ni celui de l'agent ni ceux des autres.
-                    detect_ref = f"'{sheet_src}'!${detect_col}${src_row}"
-                    display_ref = f"'{sheet_src}'!${display_col}${src_row}"
-                    inner = f'IF(ISNUMBER(SEARCH("{agent_q}",{detect_ref})),{display_ref},{inner})'
+                # Accueil/Animation et Réunion ne passent plus par ici : ils
+                # sont désormais traités plus haut (_evenement_pour_agent_creneau),
+                # avec l'horaire réel de l'événement plutôt que celui du gros
+                # bloc fusionné. Ne reste ici que RDC/Adulte/M&F/Jeunesse, qui
+                # s'appliquent légitimement à tout le bloc.
                 for col_src, label in reversed(SECTIONS_SRC):
                     inner = (f'IF(ISNUMBER(SEARCH("{agent_q}",\'{sheet_src}\'!${col_src}${src_row})),'
                               f'"{label}",{inner})')
