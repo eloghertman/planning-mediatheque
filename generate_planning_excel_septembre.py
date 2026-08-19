@@ -965,10 +965,39 @@ def generer(input_path=None, output_path=None):
         generer_vue_agent(wb, week_num, jours, row_lookup, agents_recap_vue_agent,
                            horaires_agents, pause_flex, evenements)
 
+    copier_onglets_preparation_caches(wb, raw)
+
     verrouiller_cellules_formules(wb)
     wb.save(output_path)
     print('Fichier genere:', output_path)
     return output_path, weeks_data, metadata
+
+
+# ── Onglets de préparation recopiés en "très masqué" (09/2026, demande
+# utilisatrice) ──────────────────────────────────────────────────────────
+# But : permettre à planning_checker.py (bloc 3, vérification) de relire les
+# horaires contractuels, habilitations et roulement samedi EXACTS, sans avoir
+# à redéposer le fichier de Préparation en plus du planning généré. Les
+# onglets sont recopiés tels quels (valeurs uniquement), puis rendus
+# "très masqués" (veryHidden) : invisibles dans Excel, y compris via le menu
+# clic droit > Afficher — seul un programme peut les relire.
+#
+# L'onglet "Événements" n'est volontairement PAS recopié : une fois le
+# planning modifié à la main, il n'est plus à jour ; la référence devient les
+# colonnes Accueil/Animation/Réunion/Absence (H/I/J) et les notes agents
+# (colonnes W-Z) du planning lui-même.
+ONGLETS_PREPARATION_A_RECOPIER = ['Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi']
+
+
+def copier_onglets_preparation_caches(wb, raw):
+    for nom in ONGLETS_PREPARATION_A_RECOPIER:
+        ws_src = raw.get(nom)
+        if ws_src is None:
+            continue
+        ws_dst = wb.create_sheet(f'_prep_{nom}')
+        for row in ws_src.iter_rows(values_only=True):
+            ws_dst.append(row)
+        ws_dst.sheet_state = 'veryHidden'
 
 
 def grille_fine_commune(jours):

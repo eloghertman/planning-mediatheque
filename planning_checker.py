@@ -17,6 +17,16 @@ from io import BytesIO
 
 import openpyxl
 
+from planning_engine_cpsat import (
+    parse_parametres, parse_affectations, parse_horaires_agents,
+    parse_roulement_samedi, agent_disponible, is_vacataire, _parse_fr_date,
+)
+
+# Onglets de préparation recopiés (très masqués) par generate_planning_excel_septembre.py
+# (fonction copier_onglets_preparation_caches). Préfixe '_prep_' + nom d'origine.
+ONGLETS_PREP_PREFIXE = '_prep_'
+ONGLETS_PREP_NOMS = ['Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi']
+
 
 # ─────────────────────────────────────────────────────────────
 #  RÉFÉRENTIEL MÉTIER (voir context_projet_mediatheque_v30.md §3, §7)
@@ -44,6 +54,10 @@ PAUSE_EXEMPTS = {'Delphine'}          # jamais de contrôle de pause déjeuner (
 AGENTS_IGNORES = {'lydie'}            # a quitté l'équipe, ignorée partout
 
 JOURS_ORDRE = ['LUNDI', 'MARDI', 'MERCREDI', 'JEUDI', 'VENDREDI', 'SAMEDI', 'DIMANCHE']
+# planning_engine_cpsat.py utilise 'Mardi', 'Mercredi'... (1ère lettre capitale
+# seulement) comme clé de jour dans Horaires_Des_Agents — ici on manipule les
+# jours en MAJUSCULES (titres de bloc), d'où cette table de correspondance.
+JOUR_CAPITALISE = {j: j.capitalize() for j in JOURS_ORDRE}
 
 PAUSE_FENETRE = (12 * 60, 14 * 60)    # 12h-14h, en minutes
 PAUSE_MIN_LIBRE = 60                  # minutes
@@ -63,7 +77,7 @@ def normalize(s):
 
 
 def est_vacataire(nom):
-    return 'vacataire' in normalize(nom)
+    return is_vacataire(nom or '')
 
 
 def est_eloise(nom):
@@ -149,6 +163,45 @@ class Anomalie:
 
 
 # ─────────────────────────────────────────────────────────────
+#  DONNÉES DE PRÉPARATION (onglets '_prep_...' très masqués, si présents)
+# ─────────────────────────────────────────────────────────────
+
+def charger_donnees_preparation(wb):
+    """Cherche les onglets '_prep_...' (très masqués) dans le classeur, et si
+    présents, retourne un dict avec toutes les données de préparation
+    parsées via les mêmes fonctions que le moteur de calcul
+    (planning_engine_cpsat.py) — même lecture, même vérité.
+    Retourne None si les onglets ne sont pas présents (fichier généré avec
+    une version antérieure de generate_planning_excel_septembre.py) : dans
+    ce cas, verifier_planning() se rabat sur une vérification approximative
+    à partir de la 'vue par agent' seule."""
+    raw = {}
+    for nom in ONGLETS_PREP_NOMS:
+        onglet = ONGLETS_PREP_PREFIXE + nom
+        if onglet in wb.sheetnames:
+            raw[nom] = wb[onglet]
+    if not raw:
+        return None
+
+    donnees = {'manquants': [n for n in ONGLETS_PREP_NOMS if n not in raw]}
+    try:
+        if 'Paramètres' in raw:
+            donnees['params'] = parse_parametres(raw)
+        if 'Affectations' in raw:
+            (donnees['affectations'], donnees['categories'], donnees['responsables'],
+             donnees['pause_flex'], donnees['priorite_rdc']) = parse_affectations(raw)
+        if 'Horaires_Des_Agents' in raw:
+            donnees['horaires_agents'] = parse_horaires_agents(raw)
+        if 'Roulement_Samedi' in raw:
+            donnees['roulement_type'], donnees['roulement_exceptions'] = parse_roulement_samedi(raw)
+    except Exception as e:
+        # Onglet présent mais mal formé : on retombe en mode dégradé plutôt
+        # que de faire planter toute la vérification.
+        return {'erreur_lecture': str(e)}
+    return donnees
+
+
+# ─────────────────────────────────────────────────────────────
 #  LECTURE — cellules / cellules fusionnées
 # ─────────────────────────────────────────────────────────────
 
@@ -219,6 +272,7 @@ def lire_jours_semaine(ws):
                 jours.append({
                     'jour': jour_trouve, 'titre': val.strip(),
                     'samedi_type': samedi_type,
+                    'date_str': (lambda d: d.strftime('%Y-%m-%d') if d else None)(_parse_fr_date(val)),
                     'row_titre': r, 'row_debut_data': r + 2, 'row_fin_data': r_data - 1,
                     'creneaux': creneaux,
                 })
@@ -355,8 +409,10 @@ def fusionner_occurrences(liste):
 #  RÈGLES DE VÉRIFICATION
 # ─────────────────────────────────────────────────────────────
 
-def verifier_jour(jour_data, semaine_label, vue_agent, agents_connus, anomalies):
+def verifier_jour(jour_data, semaine_label, semaine_num, vue_agent, agents_connus, prep, anomalies):
     jour = jour_data['jour']
+    jour_cap = JOUR_CAPITALISE.get(jour, jour.capitalize())
+    date_str = jour_data.get('date_str')
     occ_brutes = construire_occurrences_jour(jour_data, agents_connus)
 
     # bornes d'ouverture approximatives ce jour = 1er début / dernière fin des créneaux
@@ -365,6 +421,15 @@ def verifier_jour(jour_data, semaine_label, vue_agent, agents_connus, anomalies)
         ouverture_fin = jour_data['creneaux'][-1]['fin']
     else:
         ouverture_debut = ouverture_fin = None
+
+    mode_complet = bool(prep and 'horaires_agents' in prep)
+    horaires_agents = prep.get('horaires_agents', {}) if prep else {}
+    pause_flex = prep.get('pause_flex', set()) if prep else set()
+    affectations = prep.get('affectations', {}) if prep else {}
+    presences_vac = prep.get('params', {}).get('presences_vac', {}) if prep else {}
+    roulement_type = prep.get('roulement_type', {}) if prep else {}
+    roulement_exceptions = prep.get('roulement_exceptions', {}) if prep else {}
+    samedis_couleur = prep.get('params', {}).get('samedis', {}) if prep else {}
 
     for agent, liste in occ_brutes.items():
         if est_ignore(agent):
@@ -382,22 +447,88 @@ def verifier_jour(jour_data, semaine_label, vue_agent, agents_connus, anomalies)
                     'Eloïse jamais planifiée'))
             continue
 
-        # R1 — horaires contractuels (vue par agent)
-        info_h = vue_agent.get(agent, {}).get(jour, {})
-        arrivee, depart = info_h.get('arrivee'), info_h.get('depart')
-        for o in occs_travail:
-            if arrivee is not None and o['debut'] < arrivee:
-                anomalies.append(Anomalie(
-                    'rouge', semaine_label, jour,
-                    f"{agent} est indiqué·e en {o['type']} dès {fmt_min(o['debut'])}, "
-                    f"mais son horaire indique une arrivée à {fmt_min(arrivee)}.",
-                    'Horaires contractuels'))
-            if depart is not None and o['fin'] > depart:
-                anomalies.append(Anomalie(
-                    'rouge', semaine_label, jour,
-                    f"{agent} est indiqué·e en {o['type']} jusqu'à {fmt_min(o['fin'])}, "
-                    f"mais son horaire indique un départ à {fmt_min(depart)}.",
-                    'Horaires contractuels'))
+        # R1 + R4 — horaires contractuels ET pause déjeuner, en un seul
+        # contrôle certain (🔴) si les onglets de préparation sont
+        # disponibles : on réutilise directement agent_disponible(), la
+        # fonction que le moteur de calcul utilise lui-même pour décider si
+        # un agent peut être placé sur un créneau. Même règle, même vérité.
+        if mode_complet and not est_vacataire(agent):
+            h = horaires_agents.get(agent, {}).get(jour_cap)
+            if h is None:
+                for o in occs_travail:
+                    anomalies.append(Anomalie(
+                        'jaune', semaine_label, jour,
+                        f"{agent} est planifié·e ({o['type']}, {fmt_min(o['debut'])}-{fmt_min(o['fin'])}) "
+                        f"mais aucun horaire n'est défini pour {agent} ce jour dans Horaires_Des_Agents "
+                        f"— agent normalement absent ce jour-là ?",
+                        'Horaires contractuels'))
+            else:
+                for o in occs_travail:
+                    if not agent_disponible(agent, jour_cap, o['debut'], o['fin'], horaires_agents,
+                                             [], date_str, pause_flex):
+                        anomalies.append(Anomalie(
+                            'rouge', semaine_label, jour,
+                            f"{agent} est indiqué·e en {o['type']} de {fmt_min(o['debut'])} à {fmt_min(o['fin'])}, "
+                            f"ce qui sort de son horaire contractuel ce jour-là ou empiète sur sa pause "
+                            f"déjeuner obligatoire.",
+                            'Horaires contractuels / pause déjeuner'))
+        elif mode_complet and est_vacataire(agent):
+            # Vacataire : présence définie par le tableau "Présence Vacataire"
+            # du Paramètres (prioritaire), sinon par Horaires_Des_Agents.
+            for o in occs_travail:
+                if not agent_disponible(agent, jour_cap, o['debut'], o['fin'], horaires_agents,
+                                         [], date_str, pause_flex, presences_vac):
+                    anomalies.append(Anomalie(
+                        'rouge', semaine_label, jour,
+                        f"{agent} (vacataire) est indiqué·e de {fmt_min(o['debut'])} à {fmt_min(o['fin'])}, "
+                        f"en dehors de sa présence prévue ce jour-là (tableau Présence Vacataire / horaires).",
+                        'Présence vacataire'))
+        else:
+            # Mode dégradé (pas d'onglets de préparation dans ce fichier) :
+            # on se rabat sur la 'vue par agent' — moins précis, notamment
+            # pour la pause déjeuner (cf. limites documentées).
+            info_h = vue_agent.get(agent, {}).get(jour, {})
+            arrivee, depart = info_h.get('arrivee'), info_h.get('depart')
+            for o in occs_travail:
+                if arrivee is not None and o['debut'] < arrivee:
+                    anomalies.append(Anomalie(
+                        'rouge', semaine_label, jour,
+                        f"{agent} est indiqué·e en {o['type']} dès {fmt_min(o['debut'])}, "
+                        f"mais son horaire indique une arrivée à {fmt_min(arrivee)}.",
+                        'Horaires contractuels'))
+                if depart is not None and o['fin'] > depart:
+                    anomalies.append(Anomalie(
+                        'rouge', semaine_label, jour,
+                        f"{agent} est indiqué·e en {o['type']} jusqu'à {fmt_min(o['fin'])}, "
+                        f"mais son horaire indique un départ à {fmt_min(depart)}.",
+                        'Horaires contractuels'))
+            if agent not in PAUSE_EXEMPTS and not est_vacataire(agent):
+                pres_debut = arrivee if arrivee is not None else ouverture_debut
+                pres_fin = depart if depart is not None else ouverture_fin
+                if pres_debut is not None and pres_fin is not None:
+                    fen_debut = max(pres_debut, PAUSE_FENETRE[0])
+                    fen_fin = min(pres_fin, PAUSE_FENETRE[1])
+                    if fen_fin - fen_debut >= PAUSE_MIN_LIBRE:
+                        segs = sorted(
+                            [(max(o['debut'], fen_debut), min(o['fin'], fen_fin))
+                             for o in occs_travail if o['debut'] < fen_fin and o['fin'] > fen_debut],
+                            key=lambda x: x[0])
+                        libre_max = 0
+                        curseur = fen_debut
+                        for d, f in segs:
+                            if d > curseur:
+                                libre_max = max(libre_max, d - curseur)
+                            curseur = max(curseur, f)
+                        libre_max = max(libre_max, fen_fin - curseur)
+                        if libre_max < PAUSE_MIN_LIBRE:
+                            anomalies.append(Anomalie(
+                                'jaune', semaine_label, jour,
+                                f"{agent} ne semble pas avoir au moins 1h vraiment libre entre 12h et 14h "
+                                f"(sur la plage {fmt_min(fen_debut)}-{fmt_min(fen_fin)} où il/elle est présent·e). "
+                                f"À vérifier — peut être normal si son contrat prévoit une présence continue. "
+                                f"(Vérification approximative : les onglets de préparation ne sont pas présents "
+                                f"dans ce fichier.)",
+                                'Pause déjeuner'))
 
         # R2/R3 — chevauchements (y compris congé/absence vs travail)
         for i in range(len(occs)):
@@ -419,16 +550,17 @@ def verifier_jour(jour_data, semaine_label, vue_agent, agents_connus, anomalies)
                             f"de {fmt_min(b['debut'])} à {fmt_min(b['fin'])} — ces deux horaires se chevauchent.",
                             'Un agent à un seul endroit à la fois'))
 
-        # R5 — habilitations
-        if not est_vacataire(agent) and agent in HABILITATIONS:
+        # R5 — habilitations (Affectations si disponible, sinon liste codée en dur)
+        table_habilitations = affectations if mode_complet and affectations else HABILITATIONS
+        if not est_vacataire(agent) and agent in table_habilitations:
             for o in occs_travail:
-                if o['type'] in ('RDC', 'Adulte', 'M & F', 'Jeunesse') and o['type'] not in HABILITATIONS[agent]:
+                if o['type'] in ('RDC', 'Adulte', 'M & F', 'Jeunesse') and o['type'] not in table_habilitations[agent]:
                     anomalies.append(Anomalie(
                         'rouge', semaine_label, jour,
                         f"{agent} est affecté·e en {o['type']} de {fmt_min(o['debut'])} à {fmt_min(o['fin'])}, "
-                        f"section non habilitée (habilitations : {', '.join(HABILITATIONS[agent])}).",
+                        f"section non habilitée (habilitations : {', '.join(table_habilitations[agent])}).",
                         'Habilitations par section'))
-        elif not est_vacataire(agent) and agent not in HABILITATIONS:
+        elif not est_vacataire(agent) and agent not in table_habilitations:
             anomalies.append(Anomalie(
                 'jaune', semaine_label, jour,
                 f"'{agent}' n'est pas reconnu·e dans la liste habituelle des agents — vérifier l'orthographe "
@@ -445,32 +577,16 @@ def verifier_jour(jour_data, semaine_label, vue_agent, agents_connus, anomalies)
                         f"— un vacataire ne doit jamais être au RDC.",
                         'Vacataires jamais au RDC'))
 
-        # R4 — pause déjeuner (suspect, pas certain sans le fichier de préparation)
-        if agent not in PAUSE_EXEMPTS and not est_vacataire(agent):
-            pres_debut = arrivee if arrivee is not None else ouverture_debut
-            pres_fin = depart if depart is not None else ouverture_fin
-            if pres_debut is not None and pres_fin is not None:
-                fen_debut = max(pres_debut, PAUSE_FENETRE[0])
-                fen_fin = min(pres_fin, PAUSE_FENETRE[1])
-                if fen_fin - fen_debut >= PAUSE_MIN_LIBRE:
-                    segs = sorted(
-                        [(max(o['debut'], fen_debut), min(o['fin'], fen_fin))
-                         for o in occs_travail if o['debut'] < fen_fin and o['fin'] > fen_debut],
-                        key=lambda x: x[0])
-                    libre_max = 0
-                    curseur = fen_debut
-                    for d, f in segs:
-                        if d > curseur:
-                            libre_max = max(libre_max, d - curseur)
-                        curseur = max(curseur, f)
-                    libre_max = max(libre_max, fen_fin - curseur)
-                    if libre_max < PAUSE_MIN_LIBRE:
-                        anomalies.append(Anomalie(
-                            'jaune', semaine_label, jour,
-                            f"{agent} ne semble pas avoir au moins 1h vraiment libre entre 12h et 14h "
-                            f"(sur la plage {fmt_min(fen_debut)}-{fmt_min(fen_fin)} où il/elle est présent·e). "
-                            f"À vérifier — peut être normal si son contrat prévoit une présence continue ce jour-là.",
-                            'Pause déjeuner'))
+        # R9 — roulement samedi Bleu/Rouge (nécessite les onglets de préparation)
+        if (mode_complet and jour == 'SAMEDI' and jour_data.get('samedi_type')
+                and agent in roulement_type and occs_travail):
+            couleur_effective = roulement_exceptions.get(semaine_num, {}).get(agent, roulement_type[agent])
+            if couleur_effective != jour_data['samedi_type']:
+                anomalies.append(Anomalie(
+                    'rouge', semaine_label, jour,
+                    f"{agent} est planifié·e ce samedi {jour_data['samedi_type'].lower()}, mais son roulement "
+                    f"(éventuelles exceptions incluses) l'affecte au samedi {couleur_effective.lower() if couleur_effective else '?'}.",
+                    'Roulement samedi'))
 
     # R7 — vacataire seul en Jeunesse hors 12h-14h
     for cren in jour_data['creneaux']:
@@ -483,9 +599,6 @@ def verifier_jour(jour_data, semaine_label, vue_agent, agents_connus, anomalies)
                     f"({', '.join(jeunesse_agents)}) — autorisé seulement sur 12h-14h.",
                     'Vacataire seul en Jeunesse'))
 
-    # R10 — garde-fou : rien trouvé nulle part ce jour
-    notes = lire_notes_agents_jour  # placeholder, complété dans verifier_planning
-
 
 # ─────────────────────────────────────────────────────────────
 #  FONCTION PRINCIPALE
@@ -497,6 +610,31 @@ def verifier_planning(file_bytes):
     wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
     anomalies = []
 
+    prep = charger_donnees_preparation(wb)
+    if prep is None:
+        anomalies.append(Anomalie(
+            'jaune', '', '',
+            "Ce fichier ne contient pas les onglets de préparation (Paramètres, Horaires_Des_Agents, "
+            "Affectations, Roulement_Samedi) — probablement généré avec une version antérieure de l'outil. "
+            "La vérification se fait donc en mode approximatif (habilitations et horaires partiellement "
+            "devinés, pause déjeuner incertaine, roulement samedi et présence vacataire non vérifiables). "
+            "Régénérez le planning avec la version à jour pour une vérification complète.",
+            'Mode dégradé'))
+        prep = {}
+    elif 'erreur_lecture' in prep:
+        anomalies.append(Anomalie(
+            'jaune', '', '',
+            f"Les onglets de préparation sont présents mais n'ont pas pu être lus correctement "
+            f"({prep['erreur_lecture']}) — vérification en mode approximatif.",
+            'Mode dégradé'))
+        prep = {}
+    elif prep.get('manquants'):
+        anomalies.append(Anomalie(
+            'jaune', '', '',
+            f"Onglet(s) de préparation manquant(s) dans ce fichier : {', '.join(prep['manquants'])} "
+            f"— les vérifications correspondantes sont faites en mode approximatif ou ignorées.",
+            'Mode dégradé partiel'))
+
     semaine_sheets = sorted(
         [n for n in wb.sheetnames if re.match(r'^Semaine_\d+$', n)],
         key=lambda n: int(re.search(r'\d+', n).group())
@@ -504,11 +642,12 @@ def verifier_planning(file_bytes):
 
     for sn in semaine_sheets:
         ws = wb[sn]
+        semaine_num = int(re.search(r'\d+', sn).group())
         agent_sheet_name = f"{sn}_Agent"
         vue_agent = {}
         if agent_sheet_name in wb.sheetnames:
             vue_agent = lire_vue_agent(wb[agent_sheet_name])
-        else:
+        elif not prep.get('horaires_agents'):
             anomalies.append(Anomalie(
                 'jaune', sn, '',
                 f"L'onglet '{agent_sheet_name}' est introuvable : les horaires contractuels "
@@ -517,7 +656,7 @@ def verifier_planning(file_bytes):
 
         jours = lire_jours_semaine(ws)
         for jour_data in jours:
-            verifier_jour(jour_data, sn, vue_agent, ALL_AGENTS_CONNUS, anomalies)
+            verifier_jour(jour_data, sn, semaine_num, vue_agent, ALL_AGENTS_CONNUS, prep, anomalies)
 
             # Garde-fou : rien trouvé (ni H/I/J, ni notes W-Z) ce jour-là
             rien_dans_grille = all(

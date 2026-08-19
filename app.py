@@ -10,9 +10,7 @@ Application en une seule page (défilement vertical), organisée en 3 blocs :
      fichier de Préparation mensuelle)
   3. Vérifier un planning déjà rempli / modifié à la main
 
-Seul le bloc 1 est fonctionnel pour l'instant. Les blocs 2 et 3 sont affichés
-en aperçu (grisés) pour montrer la structure finale de la page, en attendant
-d'être branchés au moteur CP-SAT.
+Les 3 blocs sont fonctionnels.
 """
 
 import io
@@ -23,6 +21,7 @@ import streamlit as st
 
 from sources_to_evenements import generate_evenements, MOIS_FR_CAP
 from generate_planning_excel_septembre import generer
+from planning_checker import verifier_planning, resumer
 
 st.set_page_config(page_title="Planning Médiathèque", page_icon="📅", layout="centered")
 
@@ -351,18 +350,66 @@ if submitted_b2:
 st.divider()
 
 # ══════════════════════════════════════════════════════════════
-#  BLOC 3 — VÉRIFIER UN PLANNING (aperçu, pas encore branché)
+#  BLOC 3 — VÉRIFIER UN PLANNING
 # ══════════════════════════════════════════════════════════════
 
 st.header("3. Vérifier un planning")
 st.markdown(
-    "**Ce que fera ce bloc :** tu déposeras un fichier planning déjà rempli "
-    "(éventuellement modifié à la main) dans la mise en page habituelle. "
-    "L'app relira chaque case et te listera les anomalies trouvées "
-    "(quelqu'un affecté à deux endroits en même temps, un agent en congé "
-    "mais quand même planifié, Eloïse planifiée par erreur, un effectif "
-    "minimum non respecté, etc.), avec la date et le créneau concernés."
+    "**Ce que fait ce bloc :** dépose un fichier planning déjà rempli "
+    "(éventuellement modifié à la main, par toi ou par un agent) dans la "
+    "mise en page habituelle. L'app relit chaque case et te liste les "
+    "anomalies trouvées — un agent affecté à deux endroits en même temps, "
+    "un agent en congé mais quand même planifié, un horaire contractuel non "
+    "respecté, Eloïse planifiée par erreur, etc. — avec le jour et le "
+    "créneau concernés."
 )
-st.info("🚧 Ce bloc sera construit après les blocs 1 et 2.")
-st.file_uploader("Fichier planning à vérifier", disabled=True, key="stub_verif")
-st.button("Vérifier le planning", disabled=True, key="stub_verifier")
+
+f_verif = st.file_uploader("Fichier planning à vérifier", type=["xlsx"], key="f_verif")
+verifier_clicked = st.button("Vérifier le planning", type="primary", key="btn_verifier")
+
+if verifier_clicked:
+    if not f_verif:
+        st.warning("Dépose un fichier avant de lancer la vérification.")
+    else:
+        with st.spinner("Relecture du planning en cours…"):
+            try:
+                anomalies = verifier_planning(f_verif.getvalue())
+            except Exception as e:
+                st.error(
+                    "Le fichier n'a pas pu être relu. Vérifie qu'il s'agit bien "
+                    "d'un planning généré par l'app (mise en page standard).\n\n"
+                    f"Détail technique : {e}"
+                )
+                st.stop()
+
+        n_rouge, n_jaune = resumer(anomalies)
+
+        if not anomalies:
+            st.success("✅ Aucune anomalie détectée sur les règles vérifiées.")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("🔴 Impossibilités", n_rouge)
+            with col2:
+                st.metric("🟡 À vérifier", n_jaune)
+
+            # Messages généraux (pas rattachés à une semaine/jour précis :
+            # ex. mode dégradé, onglet manquant) affichés en premier.
+            generaux = [a for a in anomalies if not a.semaine and not a.jour]
+            for a in generaux:
+                (st.warning if a.gravite == 'jaune' else st.error)(a.message)
+
+            # Regroupement par semaine puis par jour
+            semaines = {}
+            for a in anomalies:
+                if a in generaux:
+                    continue
+                semaines.setdefault(a.semaine, {}).setdefault(a.jour or '(général)', []).append(a)
+
+            for semaine, jours in semaines.items():
+                with st.expander(f"📅 {semaine}", expanded=True):
+                    for jour, liste in jours.items():
+                        st.markdown(f"**{jour}**")
+                        for a in sorted(liste, key=lambda x: 0 if x.gravite == 'rouge' else 1):
+                            icone = "🔴" if a.gravite == 'rouge' else "🟡"
+                            st.markdown(f"{icone} {a.message}")
