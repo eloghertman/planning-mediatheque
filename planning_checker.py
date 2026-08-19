@@ -76,6 +76,14 @@ def normalize(s):
     return s
 
 
+def canon_section(s):
+    """Normalise un nom de section pour comparaison, insensible aux variantes
+    d'écriture ('M & F', 'M&F', 'MF', espaces, accents, casse...). Le fichier
+    Affectations et les en-têtes du planning n'utilisent pas toujours
+    exactement la même orthographe pour désigner la même section."""
+    return re.sub(r'[^a-z]', '', normalize(s))
+
+
 def est_vacataire(nom):
     return is_vacataire(nom or '')
 
@@ -553,8 +561,9 @@ def verifier_jour(jour_data, semaine_label, semaine_num, vue_agent, agents_connu
         # R5 — habilitations (Affectations si disponible, sinon liste codée en dur)
         table_habilitations = affectations if mode_complet and affectations else HABILITATIONS
         if not est_vacataire(agent) and agent in table_habilitations:
+            sections_ok = {canon_section(x) for x in table_habilitations[agent]}
             for o in occs_travail:
-                if o['type'] in ('RDC', 'Adulte', 'M & F', 'Jeunesse') and o['type'] not in table_habilitations[agent]:
+                if o['type'] in ('RDC', 'Adulte', 'M & F', 'Jeunesse') and canon_section(o['type']) not in sections_ok:
                     anomalies.append(Anomalie(
                         'rouge', semaine_label, jour,
                         f"{agent} est affecté·e en {o['type']} de {fmt_min(o['debut'])} à {fmt_min(o['fin'])}, "
