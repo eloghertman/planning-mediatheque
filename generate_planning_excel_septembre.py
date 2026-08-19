@@ -66,6 +66,22 @@ ALERT_BORDER = Border(*[Side(style='thick', color='FFE74C3C')] * 4)
 THIN_GREY = Side(style='thin', color='FFBFBFBF')
 GREY_BORDER = Border(left=THIN_GREY, right=THIN_GREY, top=THIN_GREY, bottom=THIN_GREY)
 
+# ── Surlignage jaune — événement sans agent ou sans horaire (09/2026,
+# demande utilisatrice) : même jaune que celui déjà utilisé dans
+# sources_to_evenements.py (bloc 1), pour rester cohérent visuellement.
+JAUNE_EVENEMENT_INCOMPLET = PatternFill('solid', fgColor='FFFFFF00')
+
+
+def evenement_incomplet(ev):
+    """Vrai si l'événement n'a ni agent, ni horaire renseigné — sauf les
+    événements 'libre' (Accueil libre crèche/école), où l'absence d'agent est
+    normale et ne doit jamais être signalée (même règle qu'au bloc 1)."""
+    if 'libre' in ev.get('nom', '').lower():
+        return False
+    sans_agent = not ev.get('agents')
+    sans_horaire = ev.get('cs') is None or ev.get('ce') is None
+    return sans_agent or sans_horaire
+
 # ── Couleur de police par agent (08/2026, demande utilisatrice) ────────────
 # Conservée pour le bandeau nom d'agent (vue par agent) et comme couleur de
 # repli pour les agents non couverts par la capture d'écran d'Elo.
@@ -251,9 +267,15 @@ def label_evenement_sans_noms(ev, cs, ce):
 
 
 def write_row(ws, r, values, fills, bold=False, font_size=10, alert_headers=None,
-               alert_msgs=None, discret=False, agent_fill_cols=None):
+               alert_msgs=None, discret=False, agent_fill_cols=None,
+               alerte_jaune_headers=None, alerte_jaune_msgs=None):
     alert_headers = alert_headers or set()
     alert_msgs = alert_msgs or {}
+    # Surlignage jaune "événement incomplet" (09/2026) : indépendant des
+    # alertes de couverture (bordure rouge) ci-dessus — les deux peuvent
+    # coexister sur une même cellule si les deux cas se présentent.
+    alerte_jaune_headers = alerte_jaune_headers or set()
+    alerte_jaune_msgs = alerte_jaune_msgs or {}
     # Colonnes (ex: 'RDC') où le fond ET la couleur de texte sont déterminés
     # par le(s) agent(s) présent(s), plutôt que par la section (ESSAI 08/2026,
     # demande utilisatrice — couleurs reprises de sa capture d'écran).
@@ -266,6 +288,8 @@ def write_row(ws, r, values, fills, bold=False, font_size=10, alert_headers=None
             fill, text_color = agent_cell_style(val)
             cell.fill = fill
             cell.font = Font(size=font_size, bold=True, color='FF' + text_color)
+        elif h in alerte_jaune_headers:
+            cell.fill = JAUNE_EVENEMENT_INCOMPLET
         else:
             cell.fill = PatternFill('solid', fgColor=fills[h])
         cell.border = GREY_BORDER
@@ -285,6 +309,15 @@ def write_row(ws, r, values, fills, bold=False, font_size=10, alert_headers=None
             if h in alert_msgs:
                 from openpyxl.comments import Comment
                 cell.comment = Comment('ALERTE : ' + alert_msgs[h], 'Moteur CP-SAT')
+        if h in alerte_jaune_headers and h in alerte_jaune_msgs:
+            from openpyxl.comments import Comment
+            # Si une bordure d'alerte structurelle a déjà posé un commentaire,
+            # on ne l'écrase pas : on l'étend plutôt.
+            texte = 'INCOMPLET : ' + alerte_jaune_msgs[h]
+            if cell.comment:
+                cell.comment.text += '\n' + texte
+            else:
+                cell.comment = Comment(texte, 'Moteur CP-SAT')
 
 
 def fusionner_cellules_identiques(ws, lignes, valeurs_brutes, colonnes=range(2, 10),
@@ -541,6 +574,31 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
         ws.cell(row=rr, column=NOTES_S_COL, value=f'=I{i_anchor}')
 
 
+ONGLETS_PREP_A_EMBARQUER = ['Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi']
+
+
+def embarquer_onglets_preparation(wb, input_path):
+    """Copie, en 'très masqué' (invisibles pour un agent qui ouvre le fichier —
+    même le clic droit > Afficher ne les propose pas), les onglets de
+    préparation utiles à la vérification ultérieure du planning (bloc 3 :
+    horaires contractuels exacts, habilitations, roulement samedi...).
+
+    L'onglet Événements n'est volontairement PAS copié (demande utilisatrice
+    09/2026) : une fois le planning ajusté à la main, il n'est plus à jour —
+    la référence devient les colonnes H/I/J et les notes agents (W-Z) du
+    planning généré lui-même, pas le fichier de préparation d'origine."""
+    wb_src = openpyxl.load_workbook(input_path, data_only=True)
+    for nom in ONGLETS_PREP_A_EMBARQUER:
+        if nom not in wb_src.sheetnames:
+            continue
+        ws_src = wb_src[nom]
+        nom_cible = nom if nom not in wb.sheetnames else f'_prep_{nom}'
+        ws_dst = wb.create_sheet(nom_cible)
+        for row in ws_src.iter_rows(values_only=True):
+            ws_dst.append(row)
+        ws_dst.sheet_state = 'veryHidden'
+
+
 def verrouiller_cellules_formules(wb):
     """Verrouille TOUTES les cellules contenant une formule, sur tous les
     onglets, dès la génération (demande utilisatrice 09/2026) : évite les
@@ -720,6 +778,13 @@ def generer(input_path=None, output_path=None):
                 accueil_animation = reunion = None
                 accueil_animation_sn = reunion_sn = None  # versions SANS prénoms (vue par agent)
                 absence = []
+                # Surlignage jaune (09/2026, demande utilisatrice) : un
+                # événement Accueil/Animation ou Réunion sans agent ni
+                # horaire renseigné est signalé directement sur la cellule
+                # du planning final, pas seulement dans l'onglet Événements
+                # source (bloc 1) — plus facile à repérer d'un coup d'œil.
+                accueil_incomplet = reunion_incomplet = False
+                accueil_incomplet_msg = reunion_incomplet_msg = None
                 for ev in evenements:
                     if ev['date'] != date_str:
                         continue
@@ -733,10 +798,24 @@ def generer(input_path=None, output_path=None):
                     label = label_evenement(ev, cs, ce)
                     label_sn = label_evenement_sans_noms(ev, cs, ce)
                     cat = classer_evenement(nom)
+                    incomplet = evenement_incomplet(ev)
+                    if incomplet:
+                        raisons = []
+                        if not ev.get('agents'):
+                            raisons.append('aucun agent renseigné')
+                        if ev.get('cs') is None or ev.get('ce') is None:
+                            raisons.append('horaire non renseigné')
+                        msg_incomplet = f"« {nom} » : {', '.join(raisons)}"
                     if cat == 'Réunion':
                         reunion, reunion_sn = label, label_sn
+                        reunion_incomplet = incomplet
+                        if incomplet:
+                            reunion_incomplet_msg = msg_incomplet
                     else:
                         accueil_animation, accueil_animation_sn = label, label_sn
+                        accueil_incomplet = incomplet
+                        if incomplet:
+                            accueil_incomplet_msg = msg_incomplet
                 absence_txt = f"congé ({', '.join(sorted(set(absence)))})" if absence else None
 
                 if not ouvert:
@@ -756,10 +835,20 @@ def generer(input_path=None, output_path=None):
                     jeun3_l = jeun_l[2:3]
                     values = [cren_str, rdc_l, adulte_l, mf_l, jeun1_l, jeun2_l, jeun3_l,
                               accueil_animation, reunion, absence_txt]
+                    alerte_jaune_headers = set()
+                    alerte_jaune_msgs = {}
+                    if accueil_incomplet:
+                        alerte_jaune_headers.add('Accueil / Animation')
+                        alerte_jaune_msgs['Accueil / Animation'] = accueil_incomplet_msg
+                    if reunion_incomplet:
+                        alerte_jaune_headers.add('Réunion')
+                        alerte_jaune_msgs['Réunion'] = reunion_incomplet_msg
                     write_row(ws, r, values, DATA_FILLS_OPEN,
                               alert_headers=alert_headers, alert_msgs=alert_msgs,
                               agent_fill_cols={'RDC', 'Adulte', 'M & F',
-                                               'Jeunesse 1', 'Jeunesse 2', 'Jeunesse 3'})
+                                               'Jeunesse 1', 'Jeunesse 2', 'Jeunesse 3'},
+                              alerte_jaune_headers=alerte_jaune_headers,
+                              alerte_jaune_msgs=alerte_jaune_msgs)
                     rdc, adulte, mf = fmt_agents(rdc_l), fmt_agents(adulte_l), fmt_agents(mf_l)
                     jeun1, jeun2, jeun3 = fmt_agents(jeun1_l), fmt_agents(jeun2_l), fmt_agents(jeun3_l)
                 # Texte plat (pour la fusion) : colonnes B-G depuis rdc/adulte/mf/jeun1-3,
