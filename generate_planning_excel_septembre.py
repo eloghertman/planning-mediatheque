@@ -574,7 +574,12 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
         ws.cell(row=rr, column=NOTES_S_COL, value=f'=I{i_anchor}')
 
 
-ONGLETS_PREP_A_EMBARQUER = ['Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi']
+ONGLETS_PREP_A_EMBARQUER = [
+    'Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi',
+    'Besoins_Jeunesse', 'Jours_speciaux',
+    # 'Planning_type' n'est pas ici : recopié à part, visible et verrouillé
+    # (cf. embarquer_planning_type_visible dans ce même fichier).
+]
 
 
 def embarquer_onglets_preparation(wb, input_path):
@@ -968,6 +973,9 @@ def generer(input_path=None, output_path=None):
     copier_onglets_preparation_caches(wb, raw)
 
     verrouiller_cellules_formules(wb)
+    # Appelé APRÈS verrouiller_cellules_formules (voir docstring) : sinon ses
+    # cellules seraient déverrouillées par la passe générique ci-dessus.
+    embarquer_planning_type_visible(wb, raw)
     wb.save(output_path)
     print('Fichier genere:', output_path)
     return output_path, weeks_data, metadata
@@ -986,7 +994,17 @@ def generer(input_path=None, output_path=None):
 # planning modifié à la main, il n'est plus à jour ; la référence devient les
 # colonnes Accueil/Animation/Réunion/Absence (H/I/J) et les notes agents
 # (colonnes W-Z) du planning lui-même.
-ONGLETS_PREPARATION_A_RECOPIER = ['Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi']
+ONGLETS_PREPARATION_A_RECOPIER = [
+    'Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi',
+    # Ajoutés (09/2026, demande utilisatrice) : nécessaires à planning_checker.py
+    # pour vérifier la contrainte dure "nombre d'agents Jeunesse = planning type
+    # (hors vacances) / Besoins_Jeunesse (vacances scolaires)", ainsi que la
+    # couverture RDC/Adulte/M&F par rapport au planning type.
+    # NB : 'Planning_type' n'est PAS dans cette liste — il est recopié à part,
+    # en onglet VISIBLE et verrouillé (cf. embarquer_planning_type_visible),
+    # pas en très masqué, car les agents doivent pouvoir le consulter.
+    'Besoins_Jeunesse', 'Jours_speciaux',
+]
 
 
 def copier_onglets_preparation_caches(wb, raw):
@@ -998,6 +1016,41 @@ def copier_onglets_preparation_caches(wb, raw):
         for row in ws_src.iter_rows(values_only=True):
             ws_dst.append(row)
         ws_dst.sheet_state = 'veryHidden'
+
+
+def embarquer_planning_type_visible(wb, raw):
+    """Recopie l'onglet Planning_type en onglet VISIBLE (demande utilisatrice
+    09/2026) : contrairement aux autres onglets de préparation (masqués, à
+    usage interne uniquement), le planning type doit rester consultable par
+    tous les agents qui ouvrent le fichier — c'est leur référence pour
+    comprendre l'organisation habituelle. Il est en revanche verrouillé
+    (comme une vitre : on voit à travers, mais on n'y touche pas) pour éviter
+    toute modification accidentelle. Pas de mot de passe, dans le même esprit
+    que verrouiller_cellules_formules : l'objectif est d'éviter la fausse
+    manipulation, pas de bloquer un usage volontaire (Excel permet d'ôter la
+    protection en un clic, sans mot de passe).
+
+    IMPORTANT : cette fonction doit être appelée APRÈS
+    verrouiller_cellules_formules(wb), sinon cette dernière — qui reparcourt
+    tous les onglets du classeur — déverrouillerait les cellules sans formule
+    de ce nouvel onglet (comportement voulu partout ailleurs, mais pas ici)."""
+    ws_src = raw.get('Planning_type') or raw.get('planning_type')
+    if ws_src is None:
+        return
+    nom_cible = 'Planning_type' if 'Planning_type' not in wb.sheetnames else 'Planning_type (référence)'
+    ws_dst = wb.create_sheet(nom_cible)
+    for row in ws_src.iter_rows(values_only=True):
+        ws_dst.append(row)
+    for row in ws_dst.iter_rows():
+        for cell in row:
+            cell.protection = Protection(locked=True)
+    ws_dst.protection.sheet = True
+    ws_dst.protection.formatCells = False
+    ws_dst.protection.formatColumns = False
+    ws_dst.protection.formatRows = False
+    ws_dst.protection.sort = False
+    ws_dst.protection.autoFilter = False
+    ws_dst.sheet_state = 'visible'
 
 
 def grille_fine_commune(jours):

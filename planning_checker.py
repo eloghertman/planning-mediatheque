@@ -20,12 +20,26 @@ import openpyxl
 from planning_engine_cpsat import (
     parse_parametres, parse_affectations, parse_horaires_agents,
     parse_roulement_samedi, agent_disponible, is_vacataire, _parse_fr_date,
+    parse_planning_type, parse_besoins_jeunesse, parse_jours_speciaux,
+    parse_creneau as parse_creneau_engine,
 )
 
 # Onglets de préparation recopiés (très masqués) par generate_planning_excel_septembre.py
 # (fonction copier_onglets_preparation_caches). Préfixe '_prep_' + nom d'origine.
 ONGLETS_PREP_PREFIXE = '_prep_'
-ONGLETS_PREP_NOMS = ['Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi']
+ONGLETS_PREP_NOMS = [
+    'Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi',
+    # Ajoutés (09/2026) : nécessaires à la vérification de la couverture
+    # RDC/Adulte/M&F/Jeunesse par rapport au planning type (§ ci-dessous,
+    # R10). Un fichier généré avec une version antérieure de l'outil ne les
+    # contiendra pas : ils apparaîtront alors dans 'manquants' et la
+    # vérification correspondante sera simplement sautée (pas d'erreur).
+    'Planning_type', 'Besoins_Jeunesse',
+]
+# Onglet facultatif : améliore la précision (jours de vacances scolaires
+# ponctuels / fériés en dehors du réglage habituel par semaine) mais n'est
+# pas indispensable — son absence n'est donc pas comptée dans 'manquants'.
+ONGLET_JOURS_SPECIAUX = 'Jours_speciaux'
 
 
 # ─────────────────────────────────────────────────────────────
@@ -175,17 +189,23 @@ class Anomalie:
 # ─────────────────────────────────────────────────────────────
 
 def charger_donnees_preparation(wb):
-    """Cherche les onglets '_prep_...' (très masqués) dans le classeur, et si
-    présents, retourne un dict avec toutes les données de préparation
-    parsées via les mêmes fonctions que le moteur de calcul
-    (planning_engine_cpsat.py) — même lecture, même vérité.
-    Retourne None si les onglets ne sont pas présents (fichier généré avec
-    une version antérieure de generate_planning_excel_septembre.py) : dans
-    ce cas, verifier_planning() se rabat sur une vérification approximative
-    à partir de la 'vue par agent' seule."""
+    """Cherche les onglets de préparation dans le classeur, et si présents,
+    retourne un dict avec toutes les données de préparation parsées via les
+    mêmes fonctions que le moteur de calcul (planning_engine_cpsat.py) —
+    même lecture, même vérité.
+    La plupart de ces onglets sont recopiés en '_prep_...' très masqués
+    (usage interne uniquement). 'Planning_type' fait exception (demande
+    utilisatrice 09/2026) : il est recopié en onglet VISIBLE et verrouillé
+    nommé directement 'Planning_type' (sans préfixe '_prep_'), afin que les
+    agents puissent le consulter dans Excel — on le cherche donc sous son
+    nom tel quel plutôt que sous sa version masquée.
+    Retourne None si aucun onglet de préparation n'est présent (fichier
+    généré avec une version antérieure de generate_planning_excel_septembre.py) :
+    dans ce cas, verifier_planning() se rabat sur une vérification
+    approximative à partir de la 'vue par agent' seule."""
     raw = {}
-    for nom in ONGLETS_PREP_NOMS:
-        onglet = ONGLETS_PREP_PREFIXE + nom
+    for nom in ONGLETS_PREP_NOMS + [ONGLET_JOURS_SPECIAUX]:
+        onglet = nom if nom == 'Planning_type' else ONGLETS_PREP_PREFIXE + nom
         if onglet in wb.sheetnames:
             raw[nom] = wb[onglet]
     if not raw:
@@ -202,6 +222,12 @@ def charger_donnees_preparation(wb):
             donnees['horaires_agents'] = parse_horaires_agents(raw)
         if 'Roulement_Samedi' in raw:
             donnees['roulement_type'], donnees['roulement_exceptions'] = parse_roulement_samedi(raw)
+        if 'Planning_type' in raw:
+            donnees['planning_type'] = parse_planning_type(raw)
+        if 'Besoins_Jeunesse' in raw:
+            donnees['besoins_jeunesse'] = parse_besoins_jeunesse(raw)
+        if ONGLET_JOURS_SPECIAUX in raw:
+            donnees['jours_speciaux'] = parse_jours_speciaux(raw)
     except Exception as e:
         # Onglet présent mais mal formé : on retombe en mode dégradé plutôt
         # que de faire planter toute la vérification.
@@ -596,6 +622,126 @@ def verifier_jour(jour_data, semaine_label, semaine_num, vue_agent, agents_connu
                     f"{agent} est planifié·e ce samedi {jour_data['samedi_type'].lower()}, mais son roulement "
                     f"(éventuelles exceptions incluses) l'affecte au samedi {couleur_effective.lower() if couleur_effective else '?'}.",
                     'Roulement samedi'))
+
+    # R10 — couverture RDC / Adulte / M&F / Jeunesse par rapport au planning
+    # type — CONTRAINTE DURE (demande utilisatrice 09/2026) : à chaque
+    # créneau, le nombre d'agent·es affecté·es dans chaque section doit
+    # correspondre EXACTEMENT à ce que prévoit le planning type :
+    #   - RDC / Adulte / M & F : toujours calé sur le planning type (que la
+    #     semaine soit "vacances scolaires" ou non — seule la Jeunesse
+    #     change de référence pendant les vacances, cf. moteur de calcul).
+    #   - Jeunesse : le planning type hors vacances scolaires, ou le nombre
+    #     donné par l'onglet Besoins_Jeunesse pendant les vacances scolaires
+    #     (le jour effectif "vacances" vient du réglage Semaine_N, sauf
+    #     override ponctuel via Jours_speciaux si l'onglet est présent).
+    # Un agent manquant par rapport au planning type = 🔴 "trou". Un agent en
+    # trop par rapport au planning type = 🔴 aussi (le moteur de calcul ne
+    # dépasse jamais ce nombre, donc un dépassement en main est une anomalie
+    # réelle, pas juste une préférence).
+    planning_type = prep.get('planning_type') if prep else None
+    besoins_jeunesse_data = prep.get('besoins_jeunesse') if prep else None
+    if planning_type:
+        periode_semaine = (prep.get('params', {}) or {}).get('semaines', {}).get(
+            semaine_num, 'Hors Vacances scolaires')
+        js_info = (prep.get('jours_speciaux', {}) or {}).get(date_str) if date_str else None
+        periode_effective = 'Vacances Scolaires' if (js_info and js_info.get('vacances')) else periode_semaine
+        est_vacances = 'Hors' not in str(periode_effective)
+
+        if jour == 'SAMEDI' and jour_data.get('samedi_type'):
+            pt_jour_key = f"Samedi_{jour_data['samedi_type']}"
+        else:
+            pt_jour_key = jour_cap
+        pt_jour = planning_type.get(pt_jour_key, {})
+
+        pt_blocs = []
+        for cren_str, sections_agents in pt_jour.items():
+            parsed = parse_creneau_engine(cren_str)
+            if parsed:
+                pt_blocs.append((parsed[0], parsed[1], sections_agents))
+
+        def _pt_agents(section, cs, ce):
+            """Agents prévus par le planning type pour ce créneau/section.
+            None si aucun bloc du PT ne couvre ce créneau (pas de contrainte)."""
+            for bcs, bce, sections_agents in pt_blocs:
+                if cs >= bcs and ce <= bce:
+                    return [a for a in sections_agents.get(section, []) if a and a.strip()]
+            return None
+
+        # Besoins Jeunesse (uniquement utile en période de vacances scolaires)
+        besoins_jour = {}
+        if est_vacances and besoins_jeunesse_data:
+            periode_key = next((k for k in besoins_jeunesse_data if 'Hors' not in k), None)
+            jour_key_besoin = jour_cap
+            if jour == 'SAMEDI' and jour_data.get('samedi_type'):
+                def _norm(s):
+                    return s.lower().replace('_', ' ').replace('-', ' ').strip()
+                cible = _norm(f"samedi {jour_data['samedi_type']}")
+                jours_dispo = besoins_jeunesse_data.get(periode_key, {}) if periode_key else {}
+                jour_key_besoin = next((k for k in jours_dispo if _norm(k) == cible), None)
+            if periode_key and jour_key_besoin:
+                besoins_jour = besoins_jeunesse_data.get(periode_key, {}).get(jour_key_besoin, {})
+        besoins_ranges = []
+        for cren_str, besoin in besoins_jour.items():
+            parsed = parse_creneau_engine(cren_str)
+            if parsed:
+                besoins_ranges.append((parsed[0], parsed[1], besoin))
+
+        for cren in jour_data['creneaux']:
+            cs, ce = cren['debut'], cren['fin']
+
+            # RDC / Adulte / M&F
+            for section, champ_label, val in (
+                ('RDC', 'RDC', cren['rdc']),
+                ('Adulte', 'Adulte', cren['adulte']),
+                ('MF', 'M & F', cren['mf']),
+            ):
+                pt_agents = _pt_agents(section, cs, ce)
+                if pt_agents is None:
+                    continue  # créneau hors planning type : pas de contrainte vérifiable
+                requis = len(pt_agents)
+                present = 1 if val else 0
+                if requis > present:
+                    anomalies.append(Anomalie(
+                        'rouge', semaine_label, jour,
+                        f"{champ_label} {fmt_min(cs)}-{fmt_min(ce)} : aucun·e agent·e affecté·e alors que "
+                        f"le planning type y prévoit {', '.join(pt_agents)} — trou par rapport au planning type.",
+                        'Couverture planning type'))
+                elif requis == 0 and present > 0:
+                    anomalies.append(Anomalie(
+                        'rouge', semaine_label, jour,
+                        f"{champ_label} {fmt_min(cs)}-{fmt_min(ce)} : {val} est affecté·e alors que le "
+                        f"planning type ne prévoit personne dans cette section à ce créneau.",
+                        'Couverture planning type'))
+
+            # Jeunesse
+            jeunesse_presents = [a for a in cren['jeunesse'] if a and not est_ignore(a)]
+            if est_vacances:
+                sous_tranches = [b for (bcs, bce, b) in besoins_ranges if bcs >= cs and bce <= ce]
+                if sous_tranches:
+                    requis_j = min(sous_tranches)
+                else:
+                    cren_str_exact = f'{cs//60:02d}:{cs%60:02d}-{ce//60:02d}:{ce%60:02d}'
+                    requis_j = besoins_jour.get(cren_str_exact, 0)
+                reference = 'les besoins Jeunesse en période de vacances scolaires (onglet Besoins_Jeunesse)'
+            else:
+                pt_agents_j = _pt_agents('Jeunesse', cs, ce)
+                requis_j = len(pt_agents_j) if pt_agents_j is not None else None
+                reference = 'le planning type'
+
+            if requis_j is not None:
+                if len(jeunesse_presents) < requis_j:
+                    anomalies.append(Anomalie(
+                        'rouge', semaine_label, jour,
+                        f"Jeunesse {fmt_min(cs)}-{fmt_min(ce)} : {len(jeunesse_presents)} agent(s) affecté(s) "
+                        f"({', '.join(jeunesse_presents) or 'aucun'}) alors que {reference} en prévoit "
+                        f"{requis_j} — trou en Jeunesse.",
+                        'Couverture Jeunesse'))
+                elif len(jeunesse_presents) > requis_j:
+                    anomalies.append(Anomalie(
+                        'rouge', semaine_label, jour,
+                        f"Jeunesse {fmt_min(cs)}-{fmt_min(ce)} : {len(jeunesse_presents)} agent(s) affecté(s) "
+                        f"({', '.join(jeunesse_presents)}) alors que {reference} n'en prévoit que {requis_j}.",
+                        'Couverture Jeunesse'))
 
     # R7 — vacataire seul en Jeunesse hors 12h-14h
     for cren in jour_data['creneaux']:
