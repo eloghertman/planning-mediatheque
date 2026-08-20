@@ -1018,6 +1018,43 @@ def copier_onglets_preparation_caches(wb, raw):
         ws_dst.sheet_state = 'veryHidden'
 
 
+def _copier_feuille_avec_mise_en_forme(ws_src, ws_dst):
+    """Copie une feuille source vers une feuille destination en conservant
+    TOUT le formatage d'origine (police, couleurs de remplissage, bordures,
+    alignement, format numérique), les cellules fusionnées, les largeurs de
+    colonnes et les hauteurs de lignes — pas seulement les valeurs.
+    (openpyxl ne sait copier une feuille que dans le MÊME classeur via
+    wb.copy_worksheet ; ici la source et la destination sont deux classeurs
+    différents, d'où cette copie manuelle cellule par cellule.)"""
+    for row in ws_src.iter_rows():
+        for cell in row:
+            new_cell = ws_dst.cell(row=cell.row, column=cell.column, value=cell.value)
+            if cell.has_style:
+                new_cell.font = copy(cell.font)
+                new_cell.fill = copy(cell.fill)
+                new_cell.border = copy(cell.border)
+                new_cell.alignment = copy(cell.alignment)
+                new_cell.number_format = cell.number_format
+
+    for merged_range in ws_src.merged_cells.ranges:
+        ws_dst.merge_cells(str(merged_range))
+
+    for col_letter, dim in ws_src.column_dimensions.items():
+        if dim.width is not None:
+            ws_dst.column_dimensions[col_letter].width = dim.width
+        if dim.hidden:
+            ws_dst.column_dimensions[col_letter].hidden = dim.hidden
+
+    for row_idx, dim in ws_src.row_dimensions.items():
+        if dim.height is not None:
+            ws_dst.row_dimensions[row_idx].height = dim.height
+
+    if ws_src.freeze_panes:
+        ws_dst.freeze_panes = ws_src.freeze_panes
+    if ws_src.sheet_view:
+        ws_dst.sheet_view.showGridLines = ws_src.sheet_view.showGridLines
+
+
 def embarquer_planning_type_visible(wb, raw):
     """Recopie l'onglet Planning_type en onglet VISIBLE (demande utilisatrice
     09/2026) : contrairement aux autres onglets de préparation (masqués, à
@@ -1030,6 +1067,11 @@ def embarquer_planning_type_visible(wb, raw):
     manipulation, pas de bloquer un usage volontaire (Excel permet d'ôter la
     protection en un clic, sans mot de passe).
 
+    Le formatage d'origine (couleurs, polices, bordures, colonnes fusionnées
+    Jeunesse 1/2/3, largeurs de colonnes...) est conservé à l'identique — ce
+    n'est pas une recopie de simples valeurs (correctif 09/2026, demande
+    utilisatrice : la première version perdait toutes les couleurs).
+
     IMPORTANT : cette fonction doit être appelée APRÈS
     verrouiller_cellules_formules(wb), sinon cette dernière — qui reparcourt
     tous les onglets du classeur — déverrouillerait les cellules sans formule
@@ -1039,10 +1081,14 @@ def embarquer_planning_type_visible(wb, raw):
         return
     nom_cible = 'Planning_type' if 'Planning_type' not in wb.sheetnames else 'Planning_type (référence)'
     ws_dst = wb.create_sheet(nom_cible)
-    for row in ws_src.iter_rows(values_only=True):
-        ws_dst.append(row)
+    _copier_feuille_avec_mise_en_forme(ws_src, ws_dst)
     for row in ws_dst.iter_rows():
         for cell in row:
+            # On préserve le style (police/couleurs/bordures) déjà posé par
+            # _copier_feuille_avec_mise_en_forme ci-dessus, on ajoute juste
+            # le verrouillage par-dessus (la protection est un attribut de
+            # cellule indépendant du style visuel, donc ceci ne touche pas
+            # aux couleurs).
             cell.protection = Protection(locked=True)
     ws_dst.protection.sheet = True
     ws_dst.protection.formatCells = False
