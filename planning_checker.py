@@ -141,12 +141,12 @@ def parenthese_finale(texte):
     return m.group(1) if m else None
 
 
-def extraire_agents_et_fenetre(texte, defaut_debut, defaut_fin, agents_connus):
-    """À partir d'un texte du type 'Accueil de classe (Stéphanie, 10h15-10h45)'
-    ou 'congé (Marie-France, Christine)', retourne (liste_agents, debut, fin)."""
+def _extraire_un_segment(segment, defaut_debut, defaut_fin, agents_connus):
+    """Version 'un seul événement' de l'extraction — reprend la logique
+    d'origine, appliquée à UN SEUL segment de texte (pas toute la case)."""
     agents_trouves = []
     debut, fin = defaut_debut, defaut_fin
-    inner = parenthese_finale(texte)
+    inner = parenthese_finale(segment)
     if inner:
         for part in inner.split(','):
             part = part.strip()
@@ -161,7 +161,7 @@ def extraire_agents_et_fenetre(texte, defaut_debut, defaut_fin, agents_connus):
                         agents_trouves.append(agent)
                         break
     # Cas particulier "congé (Nom1, Nom2)" : le nom du champ précède la parenthèse.
-    if texte and normalize(texte).startswith('conge') and not agents_trouves and inner:
+    if segment and normalize(segment).startswith('conge') and not agents_trouves and inner:
         for part in inner.split(','):
             part = part.strip()
             for agent in agents_connus:
@@ -169,6 +169,57 @@ def extraire_agents_et_fenetre(texte, defaut_debut, defaut_fin, agents_connus):
                     agents_trouves.append(agent)
                     break
     return agents_trouves, debut, fin
+
+
+def extraire_agents_et_fenetre(texte, defaut_debut, defaut_fin, agents_connus):
+    """À partir d'un texte du type 'Accueil de classe (Stéphanie, 10h15-10h45)'
+    ou 'congé (Marie-France, Christine)', retourne (liste_agents, debut, fin).
+
+    Une case peut combiner PLUSIEURS événements distincts, ajoutés au fil de
+    l'eau par différent·es agent·es, séparés par '; ' (cf. cascade des notes
+    W-Z, §14 du contexte projet) — ex. 'absence (Anne-Françoise); congé
+    (Stéphane)'. On découpe donc d'abord sur ce séparateur avant d'extraire,
+    pour ne perdre aucun segment (l'ancienne version ne lisait que la toute
+    dernière parenthèse de la case entière — bug découvert le 20/08 sur un
+    fichier réel : un agent absent noté AVANT un autre événement dans la même
+    case n'était jamais détecté).
+
+    ⚠️ Conservée pour compatibilité (signature d'origine) : quand plusieurs
+    segments ont des horaires DIFFÉRENTS, cette fonction renvoie la fenêtre
+    du dernier segment traité et la liste cumulée des agents — imprécis dans
+    ce cas de figure précis. Préférer `extraire_occurrences_multiples()`
+    (ci-dessous) pour un résultat exact par agent — c'est elle qu'utilise
+    désormais `construire_occurrences_jour`."""
+    agents_trouves = []
+    debut, fin = defaut_debut, defaut_fin
+    for segment in re.split(r';\s*', texte or ''):
+        segment = segment.strip()
+        if not segment:
+            continue
+        a, d, f = _extraire_un_segment(segment, defaut_debut, defaut_fin, agents_connus)
+        agents_trouves.extend(a)
+        if a:
+            debut, fin = d, f
+    return agents_trouves, debut, fin
+
+
+def extraire_occurrences_multiples(texte, defaut_debut, defaut_fin, agents_connus):
+    """Comme extraire_agents_et_fenetre, mais renvoie une liste de
+    (agent, debut, fin) — un triplet par segment/agent trouvé, chacun avec
+    SA PROPRE fenêtre horaire si elle est précisée dans son segment. C'est
+    la version à utiliser pour construire les occurrences par agent, afin
+    qu'un chevauchement (ex. absence 10h-11h d'un·e agent·e + réunion d'un·e
+    autre dans la même case) soit détecté pour la bonne personne, au bon
+    horaire — pas seulement pour le dernier segment de la case."""
+    resultat = []
+    for segment in re.split(r';\s*', texte or ''):
+        segment = segment.strip()
+        if not segment:
+            continue
+        agents, d, f = _extraire_un_segment(segment, defaut_debut, defaut_fin, agents_connus)
+        for agent in agents:
+            resultat.append((agent, d, f))
+    return resultat
 
 
 # ─────────────────────────────────────────────────────────────
@@ -404,16 +455,13 @@ def construire_occurrences_jour(jour_data, agents_connus):
             if val:
                 occ[val].append({'debut': cs, 'fin': ce, 'type': 'Jeunesse', 'detail': 'Jeunesse'})
         if cren['accueil']:
-            agents, d, f = extraire_agents_et_fenetre(cren['accueil'], cs, ce, agents_connus)
-            for a in agents:
+            for a, d, f in extraire_occurrences_multiples(cren['accueil'], cs, ce, agents_connus):
                 occ[a].append({'debut': d, 'fin': f, 'type': 'Accueil/Animation', 'detail': cren['accueil']})
         if cren['reunion']:
-            agents, d, f = extraire_agents_et_fenetre(cren['reunion'], cs, ce, agents_connus)
-            for a in agents:
+            for a, d, f in extraire_occurrences_multiples(cren['reunion'], cs, ce, agents_connus):
                 occ[a].append({'debut': d, 'fin': f, 'type': 'Réunion', 'detail': cren['reunion']})
         if cren['absence']:
-            agents, d, f = extraire_agents_et_fenetre(cren['absence'], cs, ce, agents_connus)
-            for a in agents:
+            for a, d, f in extraire_occurrences_multiples(cren['absence'], cs, ce, agents_connus):
                 occ[a].append({'debut': d, 'fin': f, 'type': 'Absence', 'detail': cren['absence']})
     return occ
 
