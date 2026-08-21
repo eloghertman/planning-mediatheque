@@ -1236,6 +1236,36 @@ def generer_vue_agent(wb, week_num, jours, row_lookup, agents_recap,
 
     date_par_jour = {j['jour']: j['date'] for j in jours}
 
+    # ── CORRECTIF (09/2026, demande utilisatrice) : remontée EN DIRECT des
+    # notes W-Z (Réunion/Accueil uniquement, cf. limite Absence documentée)
+    # vers la vue par agent. Jusqu'ici, seuls les événements déjà présents
+    # dans l'onglet Événements AU MOMENT DE LA GÉNÉRATION apparaissaient ici
+    # (texte figé, cf. _evenement_pour_agent_creneau) : une note tapée à la
+    # main APRÈS coup dans le classeur déjà généré ne remontait donc jamais
+    # dans cet onglet, alors qu'elle remonte bien dans le planning principal
+    # (colonnes H/I via formule). Cette section restaure ce comportement
+    # attendu, SOUS FORME DE FORMULE (donc live), en plus du mécanisme
+    # existant ci-dessus (qui reste prioritaire et gère la précision de durée
+    # réelle des événements déjà connus à la génération, cf. §17.5 — pas de
+    # régression sur ce point).
+    # On retrouve, pour chaque (jour, agent), la case exacte où son nom
+    # apparaît dans le petit tableau de notes (colonne W ou Y) et la case de
+    # note en face (X ou Z), en répliquant EXACTEMENT la répartition faite
+    # par ajouter_zone_notes_jour (même liste d'agents, même découpage en 2
+    # groupes, mêmes lignes).
+    notes_pos = {}  # (jour, agent) -> (helper_start_col, row)
+    mid_notes = (len(agents_recap) + 1) // 2
+    groupe1_notes, groupe2_notes = agents_recap[:mid_notes], agents_recap[mid_notes:]
+    for jour in jours_semaine:
+        lignes_ce_jour = [rr for (jj, _cs, _ce), rr in row_lookup.items() if jj == jour]
+        if not lignes_ce_jour:
+            continue
+        header_row_jour = min(lignes_ce_jour) - 1
+        for i, name in enumerate(groupe1_notes):
+            notes_pos[(jour, name)] = (NOTES_HELPER_START[NOTES_NOTE1_COL], header_row_jour + 1 + i)
+        for i, name in enumerate(groupe2_notes):
+            notes_pos[(jour, name)] = (NOTES_HELPER_START[NOTES_NOTE2_COL], header_row_jour + 1 + i)
+
     def _evenement_pour_agent_creneau(agent, jour, cs, ce):
         """Cherche un événement (hors congé) où CET agent est concerné et
         dont l'horaire RÉEL (ev['cs']/ev['ce']) chevauche ce créneau fin
@@ -1387,14 +1417,34 @@ def generer_vue_agent(wb, week_num, jours, row_lookup, agents_recap,
 
                 agent_q = agent.replace('"', '""')
                 inner = '""'
-                # Accueil/Animation et Réunion ne passent plus par ici : ils
-                # sont désormais traités plus haut (_evenement_pour_agent_creneau),
-                # avec l'horaire réel de l'événement plutôt que celui du gros
-                # bloc fusionné. Ne reste ici que RDC/Adulte/M&F/Jeunesse, qui
-                # s'appliquent légitimement à tout le bloc.
+                # Accueil/Animation et Réunion CONNUS DÈS LA GÉNÉRATION ne
+                # passent plus par ici : ils sont déjà traités plus haut
+                # (_evenement_pour_agent_creneau), avec l'horaire réel de
+                # l'événement plutôt que celui du gros bloc fusionné. Ne
+                # reste ici que RDC/Adulte/M&F/Jeunesse, qui s'appliquent
+                # légitimement à tout le bloc.
                 for col_src, label in reversed(SECTIONS_SRC):
                     inner = (f'IF(ISNUMBER(SEARCH("{agent_q}",\'{sheet_src}\'!${col_src}${src_row})),'
                               f'"{label}",{inner})')
+                # CORRECTIF 09/2026 : si une note W-Z (Réunion/Accueil) existe
+                # pour CET agent CE jour-là et que son horaire chevauche ce
+                # créneau fin, elle prend le pas sur RDC/Adulte/M&F/Jeunesse —
+                # en formule, donc mise à jour automatique si la note est
+                # tapée/modifiée après la génération. Absence (catégorie 2)
+                # volontairement exclue (limite documentée, inchangée).
+                note_pos = notes_pos.get((jour, agent))
+                if note_pos:
+                    hstart, note_row = note_pos
+                    cat_c = get_column_letter(hstart)
+                    txt_c = get_column_letter(hstart + 1)
+                    deb_c = get_column_letter(hstart + 2)
+                    fin_c = get_column_letter(hstart + 3)
+                    cs_h, ce_h = cs / 60, ce / 60
+                    note_cond = (f"AND(OR('{sheet_src}'!${cat_c}${note_row}=1,"
+                                 f"'{sheet_src}'!${cat_c}${note_row}=3),"
+                                 f"'{sheet_src}'!${deb_c}${note_row}<{ce_h},"
+                                 f"'{sheet_src}'!${fin_c}${note_row}>{cs_h})")
+                    inner = f"IF({note_cond},'{sheet_src}'!${txt_c}${note_row},{inner})"
                 cell.value = f'=IFERROR({inner},"")'
                 cell.font = Font(size=9, color='FF' + texte_agent, bold=True)
                 cell.fill = PatternFill('solid', fgColor=fond_agent)
