@@ -19,6 +19,7 @@ import openpyxl
 
 from planning_engine_cpsat import (
     parse_parametres, parse_affectations, parse_horaires_agents,
+    parse_horaires_agents_grille, ONGLET_HORAIRES_GRILLE,
     parse_roulement_samedi, agent_disponible, is_vacataire, _parse_fr_date,
     parse_planning_type, parse_besoins_jeunesse, parse_jours_speciaux,
     parse_creneau as parse_creneau_engine,
@@ -27,8 +28,11 @@ from planning_engine_cpsat import (
 # Onglets de préparation recopiés (très masqués) par generate_planning_excel_septembre.py
 # (fonction copier_onglets_preparation_caches). Préfixe '_prep_' + nom d'origine.
 ONGLETS_PREP_PREFIXE = '_prep_'
+# Ancien onglet "Horaires_Des_Agents" (liste à plat) : conservé uniquement en
+# repli, pour les fichiers déjà générés avant le passage à la grille collaborative.
+ONGLET_HORAIRES_ANCIEN = 'Horaires_Des_Agents'
 ONGLETS_PREP_NOMS = [
-    'Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi',
+    'Paramètres', ONGLET_HORAIRES_GRILLE, 'Affectations', 'Roulement_Samedi',
     # Ajoutés (09/2026) : nécessaires à la vérification de la couverture
     # RDC/Adulte/M&F/Jeunesse par rapport au planning type (§ ci-dessous,
     # R10). Un fichier généré avec une version antérieure de l'outil ne les
@@ -205,12 +209,19 @@ def extraire_agents_et_fenetre(texte, defaut_debut, defaut_fin, agents_connus):
 
 def extraire_occurrences_multiples(texte, defaut_debut, defaut_fin, agents_connus):
     """Comme extraire_agents_et_fenetre, mais renvoie une liste de
-    (agent, debut, fin) — un triplet par segment/agent trouvé, chacun avec
-    SA PROPRE fenêtre horaire si elle est précisée dans son segment. C'est
-    la version à utiliser pour construire les occurrences par agent, afin
-    qu'un chevauchement (ex. absence 10h-11h d'un·e agent·e + réunion d'un·e
-    autre dans la même case) soit détecté pour la bonne personne, au bon
-    horaire — pas seulement pour le dernier segment de la case."""
+    (agent, debut, fin, segment) — un quadruplet par segment/agent trouvé,
+    chacun avec SA PROPRE fenêtre horaire si elle est précisée dans son
+    segment, ET son PROPRE texte source (pas le texte de la case entière —
+    corrige un bug découvert le 20/08 : une case combinant plusieurs
+    événements, ex. 'absence (Anne-Françoise); congé (Stéphane)', faisait
+    porter le texte COMPLET à chaque agent, y compris à ceux qui n'étaient
+    concernés que par un seul des deux segments — ça empêchait notamment de
+    reconnaître un 'congé' comme tel dès que combiné avec autre chose dans
+    la même case). C'est la version à utiliser pour construire les
+    occurrences par agent, afin qu'un chevauchement (ex. absence 10h-11h
+    d'un·e agent·e + réunion d'un·e autre dans la même case) soit détecté
+    pour la bonne personne, au bon horaire, avec le bon texte — pas
+    seulement pour le dernier segment de la case."""
     resultat = []
     for segment in re.split(r';\s*', texte or ''):
         segment = segment.strip()
@@ -218,7 +229,7 @@ def extraire_occurrences_multiples(texte, defaut_debut, defaut_fin, agents_connu
             continue
         agents, d, f = _extraire_un_segment(segment, defaut_debut, defaut_fin, agents_connus)
         for agent in agents:
-            resultat.append((agent, d, f))
+            resultat.append((agent, d, f, segment))
     return resultat
 
 
@@ -259,17 +270,28 @@ def charger_donnees_preparation(wb):
         onglet = nom if nom == 'Planning_type' else ONGLETS_PREP_PREFIXE + nom
         if onglet in wb.sheetnames:
             raw[nom] = wb[onglet]
+    # Repli : ancienne liste à plat "Horaires_Des_Agents", pour les fichiers
+    # générés avant le passage à la grille collaborative.
+    if ONGLET_HORAIRES_GRILLE not in raw:
+        onglet_ancien = ONGLETS_PREP_PREFIXE + ONGLET_HORAIRES_ANCIEN
+        if onglet_ancien in wb.sheetnames:
+            raw[ONGLET_HORAIRES_ANCIEN] = wb[onglet_ancien]
     if not raw:
         return None
 
-    donnees = {'manquants': [n for n in ONGLETS_PREP_NOMS if n not in raw]}
+    donnees = {'manquants': [
+        n for n in ONGLETS_PREP_NOMS
+        if n not in raw and not (n == ONGLET_HORAIRES_GRILLE and ONGLET_HORAIRES_ANCIEN in raw)
+    ]}
     try:
         if 'Paramètres' in raw:
             donnees['params'] = parse_parametres(raw)
         if 'Affectations' in raw:
             (donnees['affectations'], donnees['categories'], donnees['responsables'],
              donnees['pause_flex'], donnees['priorite_rdc']) = parse_affectations(raw)
-        if 'Horaires_Des_Agents' in raw:
+        if ONGLET_HORAIRES_GRILLE in raw:
+            donnees['horaires_agents'] = parse_horaires_agents_grille(raw)
+        elif ONGLET_HORAIRES_ANCIEN in raw:
             donnees['horaires_agents'] = parse_horaires_agents(raw)
         if 'Roulement_Samedi' in raw:
             donnees['roulement_type'], donnees['roulement_exceptions'] = parse_roulement_samedi(raw)
@@ -455,14 +477,14 @@ def construire_occurrences_jour(jour_data, agents_connus):
             if val:
                 occ[val].append({'debut': cs, 'fin': ce, 'type': 'Jeunesse', 'detail': 'Jeunesse'})
         if cren['accueil']:
-            for a, d, f in extraire_occurrences_multiples(cren['accueil'], cs, ce, agents_connus):
-                occ[a].append({'debut': d, 'fin': f, 'type': 'Accueil/Animation', 'detail': cren['accueil']})
+            for a, d, f, seg in extraire_occurrences_multiples(cren['accueil'], cs, ce, agents_connus):
+                occ[a].append({'debut': d, 'fin': f, 'type': 'Accueil/Animation', 'detail': seg})
         if cren['reunion']:
-            for a, d, f in extraire_occurrences_multiples(cren['reunion'], cs, ce, agents_connus):
-                occ[a].append({'debut': d, 'fin': f, 'type': 'Réunion', 'detail': cren['reunion']})
+            for a, d, f, seg in extraire_occurrences_multiples(cren['reunion'], cs, ce, agents_connus):
+                occ[a].append({'debut': d, 'fin': f, 'type': 'Réunion', 'detail': seg})
         if cren['absence']:
-            for a, d, f in extraire_occurrences_multiples(cren['absence'], cs, ce, agents_connus):
-                occ[a].append({'debut': d, 'fin': f, 'type': 'Absence', 'detail': cren['absence']})
+            for a, d, f, seg in extraire_occurrences_multiples(cren['absence'], cs, ce, agents_connus):
+                occ[a].append({'debut': d, 'fin': f, 'type': 'Absence', 'detail': seg})
     return occ
 
 

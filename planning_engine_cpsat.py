@@ -6,6 +6,7 @@ Remplace l'ancien moteur glouton.
 
 import datetime
 import re
+import unicodedata
 from collections import defaultdict
 
 import openpyxl
@@ -279,6 +280,84 @@ def parse_horaires_agents(raw):
         fa = hhmm_to_min(row[5])
 
         horaires[agent][jour] = (dm, fm, da, fa)
+
+    return dict(horaires)
+
+
+def _normalise_nom(s):
+    """Normalise un nom pour comparaison (minuscules, sans accents ni espaces superflus)."""
+    if not s:
+        return ''
+    s = str(s).strip()
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+    return s.lower()
+
+
+# La directrice ne doit jamais apparaître comme agent planifiable, y compris
+# quand on lit ses horaires dans la grille collaborative.
+_AGENTS_EXCLUS_HORAIRES = {'eloise'}
+
+# Nom de l'onglet "grille" (fiches par agent, 4 blocs de service côte à côte :
+# ADULTES, JEUNESSE, MUSIQUE, DIRECTION/ADMINISTRATIF), tel que maintenu par
+# l'équipe dans le document collaboratif "horaires d'équipes".
+ONGLET_HORAIRES_GRILLE = "horaires d'équipes"
+
+# Repérage des 4 blocs de service dans la grille : [colonne_jour, début_matin,
+# fin_matin, début_après-midi, fin_après-midi]. Chaque bloc se répète tous les
+# 8 lignes (5 lignes de jours + en-tête + 2 lignes d'espacement), pour 5
+# emplacements d'agent possibles par bloc.
+_HORAIRES_GRILLE_BLOCS = {
+    'ADULTES': ['A', 'B', 'C', 'D', 'E'],
+    'JEUNESSE': ['H', 'I', 'J', 'K', 'L'],
+    'MUSIQUE': ['O', 'P', 'Q', 'R', 'S'],
+    'DIRECTION/ADMIN': ['V', 'W', 'X', 'Y', 'Z'],
+}
+_HORAIRES_GRILLE_GROUPES = [(8, 14), (16, 22), (24, 30), (32, 38), (40, 46)]
+
+
+def parse_horaires_agents_grille(raw):
+    """
+    Lit l'onglet "horaires d'équipes" (grille de fiches par agent) et retourne
+    exactement le même format que parse_horaires_agents :
+        {agent: {jour: (debut_matin, fin_matin, debut_apm, fin_apm)}}
+    Toutes les valeurs en minutes depuis minuit (ou None si absent).
+
+    Remplace l'ancienne liste à plat "Horaires_Des_Agents" : l'onglet visuel
+    collaboratif est désormais lu directement, sans retranscription manuelle.
+    """
+    if ONGLET_HORAIRES_GRILLE not in raw:
+        return {}
+    ws = raw[ONGLET_HORAIRES_GRILLE]
+
+    horaires = defaultdict(dict)
+
+    for cols in _HORAIRES_GRILLE_BLOCS.values():
+        day_col, m1, m2, a1, a2 = cols
+        for (start, end) in _HORAIRES_GRILLE_GROUPES:
+            name = ws[f'{m1}{start}'].value
+            if name is None or isinstance(name, (int, float)):
+                continue  # case vide, ou table "Fermeture 19h" (pas un agent)
+            if isinstance(name, str) and name.strip() in ('', '\xa0'):
+                continue
+            agent = str(name).strip()
+            if _normalise_nom(agent) in _AGENTS_EXCLUS_HORAIRES:
+                continue  # la directrice n'est jamais un agent planifiable
+
+            for r in range(start + 1, start + 6):  # Mardi -> Samedi
+                jour = ws[f'{day_col}{r}'].value
+                if not jour:
+                    continue
+                jour = str(jour).strip()
+
+                dm = hhmm_to_min(ws[f'{m1}{r}'].value)
+                fm = hhmm_to_min(ws[f'{m2}{r}'].value)
+                da = hhmm_to_min(ws[f'{a1}{r}'].value)
+                fa = hhmm_to_min(ws[f'{a2}{r}'].value)
+
+                if dm is None and fm is None and da is None and fa is None:
+                    continue  # agent absent ce jour-là (case entièrement vide)
+
+                horaires[agent][jour] = (dm, fm, da, fa)
 
     return dict(horaires)
 
@@ -1603,7 +1682,13 @@ def compute_full_planning(filepath):
 
     params         = parse_parametres(raw)
     affectations, categories, responsables, pause_flex, priorite_rdc = parse_affectations(raw)
-    horaires_agents = parse_horaires_agents(raw)
+    # Lecture directe de la grille collaborative "horaires d'équipes" ; repli sur
+    # l'ancienne liste à plat "Horaires_Des_Agents" si le fichier de préparation
+    # n'a pas encore été mis à jour avec le nouvel onglet.
+    if ONGLET_HORAIRES_GRILLE in raw:
+        horaires_agents = parse_horaires_agents_grille(raw)
+    else:
+        horaires_agents = parse_horaires_agents(raw)
     roulement_type, roulement_exceptions = parse_roulement_samedi(raw)
     besoins_jeunesse = parse_besoins_jeunesse(raw)
     evenements       = parse_evenements(raw, annee_defaut=params.get('annee'))
