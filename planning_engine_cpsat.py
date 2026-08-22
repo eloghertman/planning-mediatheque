@@ -79,10 +79,39 @@ def parse_creneau(s):
     return (cs, ce)
 
 
+def _detecter_onglet_horaires_grille(feuilles):
+    """Retrouve l'onglet "horaires d'équipes" (grille de fiches par agent)
+    même s'il a été renommé (ex: 'horaires_des_agents', 'Horaires agents'...)
+    en repérant sa mise en page caractéristique plutôt que son nom exact :
+    les en-têtes de service 'ADULTES' (case A6) et 'JEUNESSE' (case H6) ne se
+    trouvent que dans cette grille précise.
+    Retourne le nom de l'onglet trouvé, ou None."""
+    for nom, ws in feuilles.items():
+        try:
+            if ws['A6'].value == 'ADULTES' and ws['H6'].value == 'JEUNESSE':
+                return nom
+        except Exception:
+            continue
+    return None
+
+
 def load_excel_data(filepath):
-    """Charge le fichier Excel et retourne un dict {nom_onglet: worksheet}."""
+    """Charge le fichier Excel et retourne un dict {nom_onglet: worksheet}.
+
+    Ajoute automatiquement un alias sous le nom canonique de la grille
+    "horaires d'équipes" si elle existe sous un autre nom dans le fichier
+    (détection par mise en page, cf. _detecter_onglet_horaires_grille) —
+    ainsi tout le reste du code peut continuer à la chercher sous son nom
+    habituel, quel que soit le nom réel de l'onglet dans le fichier source."""
     wb = openpyxl.load_workbook(filepath, data_only=True)
-    return {ws.title: ws for ws in wb.worksheets}
+    feuilles = {ws.title: ws for ws in wb.worksheets}
+
+    if ONGLET_HORAIRES_GRILLE not in feuilles:
+        nom_trouve = _detecter_onglet_horaires_grille(feuilles)
+        if nom_trouve is not None:
+            feuilles[ONGLET_HORAIRES_GRILLE] = feuilles[nom_trouve]
+
+    return feuilles
 
 
 def parse_parametres(raw):

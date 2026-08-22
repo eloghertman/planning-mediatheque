@@ -256,18 +256,19 @@ def charger_donnees_preparation(wb):
     mêmes fonctions que le moteur de calcul (planning_engine_cpsat.py) —
     même lecture, même vérité.
     La plupart de ces onglets sont recopiés en '_prep_...' très masqués
-    (usage interne uniquement). 'Planning_type' fait exception (demande
-    utilisatrice 09/2026) : il est recopié en onglet VISIBLE et verrouillé
-    nommé directement 'Planning_type' (sans préfixe '_prep_'), afin que les
-    agents puissent le consulter dans Excel — on le cherche donc sous son
-    nom tel quel plutôt que sous sa version masquée.
+    (usage interne uniquement). 'Planning_type' et "horaires d'équipes" font
+    exception (demande utilisatrice 09/2026) : ils sont recopiés en onglets
+    VISIBLES et verrouillés, nommés directement (sans préfixe '_prep_'), afin
+    que les agents puissent les consulter dans Excel — on les cherche donc
+    sous leur nom tel quel plutôt que sous leur version masquée.
     Retourne None si aucun onglet de préparation n'est présent (fichier
     généré avec une version antérieure de generate_planning_excel_septembre.py) :
     dans ce cas, verifier_planning() se rabat sur une vérification
     approximative à partir de la 'vue par agent' seule."""
+    ONGLETS_SANS_PREFIXE = ('Planning_type', ONGLET_HORAIRES_GRILLE)
     raw = {}
     for nom in ONGLETS_PREP_NOMS + [ONGLET_JOURS_SPECIAUX]:
-        onglet = nom if nom == 'Planning_type' else ONGLETS_PREP_PREFIXE + nom
+        onglet = nom if nom in ONGLETS_SANS_PREFIXE else ONGLETS_PREP_PREFIXE + nom
         if onglet in wb.sheetnames:
             raw[nom] = wb[onglet]
     # Repli : ancienne liste à plat "Horaires_Des_Agents", pour les fichiers
