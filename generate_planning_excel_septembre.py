@@ -14,6 +14,7 @@ import re
 
 from planning_engine_cpsat import (
     compute_full_planning, load_excel_data, parse_jours_speciaux,
+    parse_horaires_agents_grille, ONGLET_HORAIRES_GRILLE,
     parse_evenements, parse_horaires_ouverture, hhmm_to_min, parse_affectations,
     parse_parametres, parse_horaires_agents
 )
@@ -643,7 +644,13 @@ def generer(input_path=None, output_path=None):
     # Eloïse (jamais dans ce tableau, cf. parse_affectations).
     affectations, categories, responsables, pause_flex, priorite_rdc = parse_affectations(raw)
     agents_recap = list(affectations.keys())
-    horaires_agents = parse_horaires_agents(raw)
+    # Lecture directe de la grille collaborative "horaires d'équipes" ; repli
+    # sur l'ancienne liste à plat "Horaires_Des_Agents" si le fichier de
+    # préparation n'a pas encore été mis à jour avec le nouvel onglet.
+    if ONGLET_HORAIRES_GRILLE in raw:
+        horaires_agents = parse_horaires_agents_grille(raw)
+    else:
+        horaires_agents = parse_horaires_agents(raw)
     # Agents réguliers hors vacataires, dans l'ordre du fichier Affectations —
     # sert de base à la zone de notes agents (09/2026) : 2 groupes de colonnes
     # (7 + 7, ou moins si l'équipe est plus petite / plus grande) à côté de
@@ -976,6 +983,7 @@ def generer(input_path=None, output_path=None):
     # Appelé APRÈS verrouiller_cellules_formules (voir docstring) : sinon ses
     # cellules seraient déverrouillées par la passe générique ci-dessus.
     embarquer_planning_type_visible(wb, raw)
+    embarquer_horaires_agents_visible(wb, raw)
     wb.save(output_path)
     print('Fichier genere:', output_path)
     return output_path, weeks_data, metadata
@@ -995,16 +1003,22 @@ def generer(input_path=None, output_path=None):
 # colonnes Accueil/Animation/Réunion/Absence (H/I/J) et les notes agents
 # (colonnes W-Z) du planning lui-même.
 ONGLETS_PREPARATION_A_RECOPIER = [
-    'Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi',
+    'Paramètres', 'Affectations', 'Roulement_Samedi',
     # Ajoutés (09/2026, demande utilisatrice) : nécessaires à planning_checker.py
     # pour vérifier la contrainte dure "nombre d'agents Jeunesse = planning type
     # (hors vacances) / Besoins_Jeunesse (vacances scolaires)", ainsi que la
     # couverture RDC/Adulte/M&F par rapport au planning type.
-    # NB : 'Planning_type' n'est PAS dans cette liste — il est recopié à part,
-    # en onglet VISIBLE et verrouillé (cf. embarquer_planning_type_visible),
-    # pas en très masqué, car les agents doivent pouvoir le consulter.
+    # NB : ni 'Planning_type' ni "horaires d'équipes" ne sont dans cette liste
+    # — ils sont recopiés à part, en onglet VISIBLE et verrouillé (cf.
+    # embarquer_planning_type_visible / embarquer_horaires_agents_visible),
+    # pas en très masqué, car les agents doivent pouvoir les consulter.
     'Besoins_Jeunesse', 'Jours_speciaux',
 ]
+
+# Ancien onglet "Horaires_Des_Agents" (liste à plat) : recopié en masqué
+# uniquement en repli, pour les fichiers de préparation pas encore migrés
+# vers la grille collaborative "horaires d'équipes".
+ONGLET_HORAIRES_ANCIEN = 'Horaires_Des_Agents'
 
 
 def copier_onglets_preparation_caches(wb, raw):
@@ -1016,6 +1030,16 @@ def copier_onglets_preparation_caches(wb, raw):
         for row in ws_src.iter_rows(values_only=True):
             ws_dst.append(row)
         ws_dst.sheet_state = 'veryHidden'
+
+    # Repli (voir plus haut) : uniquement si le fichier de préparation n'a pas
+    # encore l'onglet grille "horaires d'équipes".
+    if ONGLET_HORAIRES_GRILLE not in raw:
+        ws_src = raw.get(ONGLET_HORAIRES_ANCIEN)
+        if ws_src is not None:
+            ws_dst = wb.create_sheet(f'_prep_{ONGLET_HORAIRES_ANCIEN}')
+            for row in ws_src.iter_rows(values_only=True):
+                ws_dst.append(row)
+            ws_dst.sheet_state = 'veryHidden'
 
 
 def _copier_feuille_avec_mise_en_forme(ws_src, ws_dst):
@@ -1089,6 +1113,44 @@ def embarquer_planning_type_visible(wb, raw):
             # le verrouillage par-dessus (la protection est un attribut de
             # cellule indépendant du style visuel, donc ceci ne touche pas
             # aux couleurs).
+            cell.protection = Protection(locked=True)
+    ws_dst.protection.sheet = True
+    ws_dst.protection.formatCells = False
+    ws_dst.protection.formatColumns = False
+    ws_dst.protection.formatRows = False
+    ws_dst.protection.sort = False
+    ws_dst.protection.autoFilter = False
+    ws_dst.sheet_state = 'visible'
+
+
+def embarquer_horaires_agents_visible(wb, raw):
+    """Recopie l'onglet "horaires d'équipes" (grille collaborative) en onglet
+    VISIBLE et verrouillé dans le planning généré — même principe que
+    embarquer_planning_type_visible ci-dessus (demande utilisatrice 08/2026) :
+    les agents doivent pouvoir consulter leurs horaires contractuels
+    directement dans le fichier généré, sous la forme familière (fiches par
+    agent), plutôt que via une liste à plat masquée.
+
+    Le formatage d'origine (couleurs, hachures des demi-journées non
+    travaillées, polices, colonnes fusionnées, largeurs...) est conservé à
+    l'identique. Verrouillage sans mot de passe, dans le même esprit que pour
+    Planning_type : on protège des fausses manipulations, pas d'un usage
+    volontaire.
+
+    IMPORTANT : comme pour Planning_type, doit être appelée APRÈS
+    verrouiller_cellules_formules(wb) — sinon celle-ci déverrouillerait les
+    cellules sans formule de ce nouvel onglet."""
+    ws_src = raw.get(ONGLET_HORAIRES_GRILLE)
+    if ws_src is None:
+        return
+    nom_cible = (ONGLET_HORAIRES_GRILLE if ONGLET_HORAIRES_GRILLE not in wb.sheetnames
+                 else f'{ONGLET_HORAIRES_GRILLE} (référence)')
+    ws_dst = wb.create_sheet(nom_cible)
+    _copier_feuille_avec_mise_en_forme(ws_src, ws_dst)
+    for row in ws_dst.iter_rows():
+        for cell in row:
+            # Comme pour Planning_type : le style (déjà posé ci-dessus) n'est
+            # pas touché, on ajoute seulement le verrouillage.
             cell.protection = Protection(locked=True)
     ws_dst.protection.sheet = True
     ws_dst.protection.formatCells = False
