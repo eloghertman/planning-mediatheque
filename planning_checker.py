@@ -19,7 +19,6 @@ import openpyxl
 
 from planning_engine_cpsat import (
     parse_parametres, parse_affectations, parse_horaires_agents,
-    parse_horaires_agents_grille, ONGLET_HORAIRES_GRILLE,
     parse_roulement_samedi, agent_disponible, is_vacataire, _parse_fr_date,
     parse_planning_type, parse_besoins_jeunesse, parse_jours_speciaux,
     parse_creneau as parse_creneau_engine,
@@ -28,11 +27,8 @@ from planning_engine_cpsat import (
 # Onglets de préparation recopiés (très masqués) par generate_planning_excel_septembre.py
 # (fonction copier_onglets_preparation_caches). Préfixe '_prep_' + nom d'origine.
 ONGLETS_PREP_PREFIXE = '_prep_'
-# Ancien onglet "Horaires_Des_Agents" (liste à plat) : conservé uniquement en
-# repli, pour les fichiers déjà générés avant le passage à la grille collaborative.
-ONGLET_HORAIRES_ANCIEN = 'Horaires_Des_Agents'
 ONGLETS_PREP_NOMS = [
-    'Paramètres', ONGLET_HORAIRES_GRILLE, 'Affectations', 'Roulement_Samedi',
+    'Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi',
     # Ajoutés (09/2026) : nécessaires à la vérification de la couverture
     # RDC/Adulte/M&F/Jeunesse par rapport au planning type (§ ci-dessous,
     # R10). Un fichier généré avec une version antérieure de l'outil ne les
@@ -256,43 +252,31 @@ def charger_donnees_preparation(wb):
     mêmes fonctions que le moteur de calcul (planning_engine_cpsat.py) —
     même lecture, même vérité.
     La plupart de ces onglets sont recopiés en '_prep_...' très masqués
-    (usage interne uniquement). 'Planning_type' et "horaires d'équipes" font
-    exception (demande utilisatrice 09/2026) : ils sont recopiés en onglets
-    VISIBLES et verrouillés, nommés directement (sans préfixe '_prep_'), afin
-    que les agents puissent les consulter dans Excel — on les cherche donc
-    sous leur nom tel quel plutôt que sous leur version masquée.
+    (usage interne uniquement). 'Planning_type' fait exception (demande
+    utilisatrice 09/2026) : il est recopié en onglet VISIBLE et verrouillé
+    nommé directement 'Planning_type' (sans préfixe '_prep_'), afin que les
+    agents puissent le consulter dans Excel — on le cherche donc sous son
+    nom tel quel plutôt que sous sa version masquée.
     Retourne None si aucun onglet de préparation n'est présent (fichier
     généré avec une version antérieure de generate_planning_excel_septembre.py) :
     dans ce cas, verifier_planning() se rabat sur une vérification
     approximative à partir de la 'vue par agent' seule."""
-    ONGLETS_SANS_PREFIXE = ('Planning_type', ONGLET_HORAIRES_GRILLE)
     raw = {}
     for nom in ONGLETS_PREP_NOMS + [ONGLET_JOURS_SPECIAUX]:
-        onglet = nom if nom in ONGLETS_SANS_PREFIXE else ONGLETS_PREP_PREFIXE + nom
+        onglet = nom if nom == 'Planning_type' else ONGLETS_PREP_PREFIXE + nom
         if onglet in wb.sheetnames:
             raw[nom] = wb[onglet]
-    # Repli : ancienne liste à plat "Horaires_Des_Agents", pour les fichiers
-    # générés avant le passage à la grille collaborative.
-    if ONGLET_HORAIRES_GRILLE not in raw:
-        onglet_ancien = ONGLETS_PREP_PREFIXE + ONGLET_HORAIRES_ANCIEN
-        if onglet_ancien in wb.sheetnames:
-            raw[ONGLET_HORAIRES_ANCIEN] = wb[onglet_ancien]
     if not raw:
         return None
 
-    donnees = {'manquants': [
-        n for n in ONGLETS_PREP_NOMS
-        if n not in raw and not (n == ONGLET_HORAIRES_GRILLE and ONGLET_HORAIRES_ANCIEN in raw)
-    ]}
+    donnees = {'manquants': [n for n in ONGLETS_PREP_NOMS if n not in raw]}
     try:
         if 'Paramètres' in raw:
             donnees['params'] = parse_parametres(raw)
         if 'Affectations' in raw:
             (donnees['affectations'], donnees['categories'], donnees['responsables'],
              donnees['pause_flex'], donnees['priorite_rdc']) = parse_affectations(raw)
-        if ONGLET_HORAIRES_GRILLE in raw:
-            donnees['horaires_agents'] = parse_horaires_agents_grille(raw)
-        elif ONGLET_HORAIRES_ANCIEN in raw:
+        if 'Horaires_Des_Agents' in raw:
             donnees['horaires_agents'] = parse_horaires_agents(raw)
         if 'Roulement_Samedi' in raw:
             donnees['roulement_type'], donnees['roulement_exceptions'] = parse_roulement_samedi(raw)
