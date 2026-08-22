@@ -21,7 +21,12 @@ import streamlit as st
 
 from sources_to_evenements import generate_evenements, MOIS_FR_CAP
 from generate_planning_excel_septembre import generer
-from planning_checker import verifier_planning, resumer
+from planning_checker import verifier_planning, resumer, lire_jours_semaine, JOUR_CAPITALISE
+from regeneration_lecture import (
+    lire_planning_pour_regeneration, resumer_lecture, ErreurRegeneration,
+)
+from regeneration_calcul import regenerer_jours, resumer_calcul
+from regeneration_ecriture import ecrire_regeneration
 
 st.set_page_config(page_title="Planning Médiathèque", page_icon="📅", layout="centered")
 
@@ -75,9 +80,33 @@ def _save_uploaded_list(uploaded_files, tmp_dir):
     return [_save_uploaded(f, tmp_dir) for f in uploaded_files]
 
 
+def _lister_semaines_disponibles(file_bytes):
+    """Repère les onglets 'Semaine_N' présents dans le fichier (juste les
+    noms d'onglets, lecture très légère) pour remplir le sélecteur."""
+    import openpyxl as _openpyxl
+    wb = _openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    numeros = []
+    for nom in wb.sheetnames:
+        if nom.startswith("Semaine_") and nom[8:].isdigit():
+            numeros.append(int(nom[8:]))
+    wb.close()
+    return sorted(numeros)
+
+
+def _lister_jours_disponibles(file_bytes, semaine_num):
+    """Repère les jours présents dans l'onglet 'Semaine_N' choisi, avec leur
+    date, pour remplir le sélecteur de jours à régénérer."""
+    import openpyxl as _openpyxl
+    wb = _openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    ws = wb[f"Semaine_{semaine_num}"]
+    jours_data = lire_jours_semaine(ws)
+    wb.close()
+    return [(j["jour"], j.get("titre", j["jour"])) for j in jours_data]
+
+
 st.title("📅 Assistant Planning Médiathèque")
 st.caption(
-    "Une page, trois étapes. Chaque étape est indépendante : tu génères un "
+    "Une page, quatre étapes. Chaque étape est indépendante : tu génères un "
     "fichier, tu le télécharges, et tu le réutilises toi-même à l'étape "
     "suivante si besoin."
 )
@@ -413,3 +442,163 @@ if verifier_clicked:
                         for a in sorted(liste, key=lambda x: 0 if x.gravite == 'rouge' else 1):
                             icone = "🔴" if a.gravite == 'rouge' else "🟡"
                             st.markdown(f"{icone} {a.message}")
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════════
+#  BLOC 4 — RÉGÉNÉRER UN PLANNING EXISTANT
+# ══════════════════════════════════════════════════════════════
+
+st.header("4. Régénérer un planning existant")
+st.markdown(
+    "**Ce que fait ce bloc :** dépose un planning déjà généré (et déjà "
+    "modifié à la main si besoin — congés, réunions, notes agents...). "
+    "Choisis UNE semaine et un ou plusieurs jours à refaire : l'app efface "
+    "uniquement les colonnes RDC / Adulte / M&F / Jeunesse de ces jours-là "
+    "et les recalcule avec le même moteur que d'habitude, en tenant compte "
+    "de ce qui est déjà noté (congés, réunions, absences). Le reste du "
+    "fichier — les autres jours, les autres semaines — n'est jamais "
+    "touché.\n\n"
+    "⚠️ Les onglets 'Planning_type' et 'horaires d'équipes' visibles dans "
+    "ce fichier sont utilisés tels quels pour le recalcul. Si tu as besoin "
+    "de les modifier avant de relancer, il faut d'abord les déverrouiller "
+    "dans Excel (clic droit sur l'onglet → Ôter la protection de la "
+    "feuille, aucun mot de passe requis)."
+)
+
+f_planning_regen = st.file_uploader(
+    "Fichier planning du mois à régénérer", type=["xlsx"], key="f_regen_fichier"
+)
+
+if f_planning_regen:
+    file_bytes_regen = f_planning_regen.getvalue()
+
+    try:
+        semaines_dispo = _lister_semaines_disponibles(file_bytes_regen)
+    except Exception as e:
+        st.error(f"Impossible de lire ce fichier. Détail technique : {e}")
+        semaines_dispo = []
+
+    if not semaines_dispo:
+        st.warning("Aucun onglet 'Semaine_N' trouvé dans ce fichier — "
+                    "vérifie qu'il s'agit bien d'un planning généré par l'app.")
+    else:
+        semaine_choisie = st.selectbox(
+            "Semaine à régénérer", semaines_dispo, key="regen_semaine"
+        )
+
+        try:
+            jours_dispo = _lister_jours_disponibles(file_bytes_regen, semaine_choisie)
+        except Exception as e:
+            st.error(f"Impossible de lire les jours de cette semaine. Détail technique : {e}")
+            jours_dispo = []
+
+        if not jours_dispo:
+            st.warning("Aucun jour reconnu dans cette semaine.")
+        else:
+            labels_jours = {j: titre.strip() for j, titre in jours_dispo}
+            jours_choisis = st.multiselect(
+                "Jour(s) à régénérer",
+                options=[j for j, _ in jours_dispo],
+                format_func=lambda j: labels_jours.get(j, j),
+                key="regen_jours",
+            )
+
+            lancer_regen = st.button(
+                "Lancer la régénération", type="primary", key="btn_regen"
+            )
+
+            if lancer_regen:
+                if not jours_choisis:
+                    st.warning("Choisis au moins un jour à régénérer.")
+                else:
+                    with st.spinner("Lecture du planning existant…"):
+                        try:
+                            lecture = lire_planning_pour_regeneration(
+                                file_bytes_regen, semaine_choisie, jours_choisis
+                            )
+                        except ErreurRegeneration as e:
+                            st.error(str(e))
+                            st.stop()
+                        except Exception as e:
+                            st.error(
+                                "Erreur inattendue en lisant le fichier. "
+                                f"Détail technique : {e}"
+                            )
+                            st.stop()
+
+                    st.markdown("**Ce qui a été lu dans le fichier :**")
+                    st.text(resumer_lecture(lecture))
+
+                    if lecture["conflits"]:
+                        st.warning(
+                            f"⚠️ {len(lecture['conflits'])} conflit(s) trouvé(s) entre "
+                            "éléments déjà notés (congé / réunion / absence qui se "
+                            "chevauchent pour un même agent). Le calcul continue quand "
+                            "même — ces conflits seront signalés par un cadre rouge et "
+                            "un commentaire sur les cases concernées dans le fichier final, "
+                            "à toi de trancher lequel des deux est le bon."
+                        )
+
+                    with st.spinner("Recalcul du/des jour(s) en cours…"):
+                        try:
+                            calcul = regenerer_jours(lecture)
+                        except Exception as e:
+                            st.error(
+                                f"Le recalcul n'a pas pu aboutir. Détail technique : {e}"
+                            )
+                            st.stop()
+
+                    st.markdown("**Résultat du recalcul :**")
+                    st.text(resumer_calcul(calcul))
+
+                    jours_infaisables_calcul = [
+                        j["jour"] for j in calcul["jours"] if j["infaisable"]
+                    ]
+                    if jours_infaisables_calcul:
+                        st.error(
+                            "❌ Aucune solution trouvée pour : "
+                            f"{', '.join(jours_infaisables_calcul)}. Ces jours-là "
+                            "n'ont PAS été modifiés dans le fichier — ils gardent "
+                            "leur contenu précédent tel quel."
+                        )
+
+                    with st.spinner("Écriture du nouveau fichier…"):
+                        try:
+                            new_bytes, jours_infaisables_ecriture, agent_sheet_ok = (
+                                ecrire_regeneration(file_bytes_regen, lecture, calcul)
+                            )
+                        except Exception as e:
+                            st.error(
+                                "L'écriture du fichier final a échoué. "
+                                f"Détail technique : {e}"
+                            )
+                            st.stop()
+
+                    if lecture["jours_fixes"]:
+                        st.info(
+                            "ℹ️ Comme seule une partie de la semaine a été régénérée, "
+                            "l'onglet 'vue par agent' de cette semaine n'a pas été "
+                            "reconstruit automatiquement (limite connue) — il garde "
+                            "l'affichage d'avant sur les jours non régénérés. À vérifier "
+                            "à la main si besoin."
+                        )
+
+                    if not jours_infaisables_calcul:
+                        st.success("✅ Nouveau fichier prêt.")
+                    else:
+                        st.success(
+                            "✅ Nouveau fichier prêt (avec les jours infaisables "
+                            "laissés inchangés, voir ci-dessus)."
+                        )
+
+                    nom_base = f_planning_regen.name.rsplit(".", 1)[0]
+                    nom_fichier_regen = f"{nom_base}_REGENERE_S{semaine_choisie}.xlsx"
+
+                    st.download_button(
+                        "⬇️ Télécharger le planning régénéré",
+                        data=new_bytes,
+                        file_name=nom_fichier_regen,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_regen",
+                    )
