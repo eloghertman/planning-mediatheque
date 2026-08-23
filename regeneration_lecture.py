@@ -172,15 +172,24 @@ def lire_planning_pour_regeneration(file_bytes, semaine_num, jours_a_regenerer):
     jours_regeneres = cibles_norm
     jours_fixes = [j for j in jours_dispo if j not in cibles_norm]
 
-    # ── 3. Contraintes figées du/des jour(s) à régénérer ────────────────
+    # ── 3. Contraintes figées (Accueil/Réunion/Absence) ──────────────────
     # On lit H/I/J + notes W-Z (déjà combinées par les formules du fichier)
-    # de CES jours-là uniquement, et on ne garde QUE les occurrences de type
-    # Accueil/Animation, Réunion, Absence — jamais les affectations B-G
-    # (RDC/Adulte/M&F/Jeunesse), qui seront effacées par la brique 2.
-    evenements_regeneres = []
-    for jour_key in jours_regeneres:
+    # et on ne garde QUE les occurrences de type Accueil/Animation, Réunion,
+    # Absence — jamais les affectations B-G (RDC/Adulte/M&F/Jeunesse).
+    #
+    # Fait pour TOUS les jours de la semaine (régénérés ET fixes) :
+    # - pour les jours à régénérer, ces événements servent de CONTRAINTES
+    #   FIGÉES au moteur de calcul (brique 2) → 'evenements_regeneres' ;
+    # - pour les jours fixes, ils servent seulement à reconstruire
+    #   correctement l'onglet "vue par agent" (brique 3), qui couvre
+    #   toujours la semaine entière → inclus en plus dans
+    #   'evenements_tous_jours'. Corrige la limite du 22/08 : avant, cet
+    #   onglet n'était reconstruit (donc le lien direct avec les notes
+    #   W-Z restait actif) que si TOUTE la semaine était régénérée.
+    def _extraire_evenements_jour(jour_key):
         jour_data = jours_dispo[jour_key]
         date_str = jour_data.get('date_str')
+        evs = []
         occ_brutes = construire_occurrences_jour(jour_data, ALL_AGENTS_CONNUS)
         for agent, liste in occ_brutes.items():
             if est_ignore(agent) or est_eloise(agent):
@@ -205,7 +214,7 @@ def lire_planning_pour_regeneration(file_bytes, semaine_num, jours_a_regenerer):
                     nom = 'congé'
                 else:
                     nom = _nom_propre(occ['detail'])
-                evenements_regeneres.append({
+                evs.append({
                     'date': date_str,
                     'cs': occ['debut'],
                     'ce': occ['fin'],
@@ -214,6 +223,17 @@ def lire_planning_pour_regeneration(file_bytes, semaine_num, jours_a_regenerer):
                     'type': occ['type'],
                     'agents': [agent],
                 })
+        return evs
+
+    evenements_regeneres = []
+    for jour_key in jours_regeneres:
+        evenements_regeneres.extend(_extraire_evenements_jour(jour_key))
+
+    evenements_fixes = []
+    for jour_key in jours_fixes:
+        evenements_fixes.extend(_extraire_evenements_jour(jour_key))
+
+    evenements_tous_jours = evenements_regeneres + evenements_fixes
 
     # ── 4. Heures déjà travaillées cette semaine, sur les jours FIXES ───
     # Sert à la brique 2 pour démarrer son compteur d'équité hebdomadaire
@@ -274,6 +294,7 @@ def lire_planning_pour_regeneration(file_bytes, semaine_num, jours_a_regenerer):
         'jours_fixes': jours_fixes,
         'prep': prep,
         'evenements_regeneres': evenements_regeneres,
+        'evenements_tous_jours': evenements_tous_jours,
         'heures_deja_semaine': dict(heures_deja_semaine),
         'conflits': conflits,
         'jours_data_bruts': jours_dispo,

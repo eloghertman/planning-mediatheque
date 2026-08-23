@@ -3,14 +3,16 @@
 app.py — Assistant Planning Médiathèque
 =========================================
 
-Application en une seule page (défilement vertical), organisée en 3 blocs :
+Application en une seule page (défilement vertical), organisée en 4 blocs :
 
   1. Créer l'onglet Événements à partir des fichiers sources bruts
   2. Générer le planning mensuel (à partir du fichier Événements + du
      fichier de Préparation mensuelle)
   3. Vérifier un planning déjà rempli / modifié à la main
+  4. Régénérer un ou plusieurs jours d'un planning déjà généré, sans
+     toucher au reste du fichier
 
-Les 3 blocs sont fonctionnels.
+Les 4 blocs sont fonctionnels.
 """
 
 import io
@@ -574,15 +576,6 @@ if f_planning_regen:
                                 f"Détail technique : {e}"
                             )
                             st.stop()
-
-                    if lecture["jours_fixes"]:
-                        st.info(
-                            "ℹ️ Comme seule une partie de la semaine a été régénérée, "
-                            "l'onglet 'vue par agent' de cette semaine n'a pas été "
-                            "reconstruit automatiquement (limite connue) — il garde "
-                            "l'affichage d'avant sur les jours non régénérés. À vérifier "
-                            "à la main si besoin."
-                        )
 
                     if not jours_infaisables_calcul:
                         st.success("✅ Nouveau fichier prêt.")

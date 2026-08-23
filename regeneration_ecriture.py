@@ -172,55 +172,48 @@ def ecrire_regeneration(file_bytes, lecture_resultat, calcul_resultat):
             # fichier dans Excel — rien à faire ici.
 
     # ── 2. Reconstruction de l'onglet "vue par agent" ("Semaine_N_Agent") ──
-    # Cet onglet n'est PAS mis à jour par une formule en direct pour le
-    # marquage "Congé" (gris) — il est figé au moment de la génération
-    # d'origine (cf. generer_vue_agent dans le générateur principal). Donc
-    # si on ne le reconstruit pas, il continue d'afficher l'état d'AVANT la
-    # régénération pour tout ce qui touche aux congés/événements — c'est
-    # exactement ce qu'a remarqué l'utilisatrice le 20/08 (Stéphane).
-    #
-    # ⚠️ Limite actuelle : cette reconstruction n'est faite que si TOUTE la
-    # semaine a été régénérée. Pour une régénération partielle (certains
-    # jours restent fixes), on ne connaît pas encore les événements des
-    # jours fixes ici (la brique 1 ne les lit pas) — les reconstruire quand
-    # même donnerait une vue par agent fausse sur ces jours-là. Dans ce
-    # cas, on laisse l'onglet "Semaine_N_Agent" tel quel et on le signale.
-    agent_sheet_reconstruit = False
-    if not lecture_resultat['jours_fixes']:
-        prep = lecture_resultat['prep']
-        affectations = prep.get('affectations', {})
-        horaires_agents = prep.get('horaires_agents', {})
-        pause_flex = prep.get('pause_flex', set())
-        agents_recap_vue_agent = [a for a in affectations.keys() if not is_vacataire(a)]
+    # Cet onglet est reconstruit à CHAQUE régénération, même partielle
+    # (certains jours de la semaine restent fixes) — corrigé le 22/08 :
+    # avant, ce n'était fait que si toute la semaine était régénérée, sinon
+    # l'onglet gardait l'affichage d'AVANT la régénération (le lien direct
+    # avec les notes W-Z semblait "cassé"). La brique 1 fournit maintenant
+    # les événements (congés/réunions/absences) de TOUS les jours de la
+    # semaine, régénérés ou fixes, ce qui permet cette reconstruction
+    # complète et correcte à chaque fois.
+    prep = lecture_resultat['prep']
+    affectations = prep.get('affectations', {})
+    horaires_agents = prep.get('horaires_agents', {})
+    pause_flex = prep.get('pause_flex', set())
+    agents_recap_vue_agent = [a for a in affectations.keys() if not is_vacataire(a)]
 
-        jours_ordonnes = sorted(jours_dispo.keys(),
-                                  key=lambda j: JOURS_ORDRE.index(j) if j in JOURS_ORDRE else 99)
-        jours_arg = []
-        row_lookup = {}
-        for jour_maj in jours_ordonnes:
-            jd = jours_dispo[jour_maj]
-            jour_cap = jour_maj.capitalize()  # 'MERCREDI' -> 'Mercredi', suffit ici
-            creneaux_jour = [(cren['debut'], cren['fin']) for cren in jd['creneaux']]
-            jours_arg.append({'jour': jour_cap, 'date': jd.get('date_str'),
-                               'creneaux': creneaux_jour})
-            for cren in jd['creneaux']:
-                row_lookup[(jour_cap, cren['debut'], cren['fin'])] = cren['row']
+    jours_ordonnes = sorted(jours_dispo.keys(),
+                              key=lambda j: JOURS_ORDRE.index(j) if j in JOURS_ORDRE else 99)
+    jours_arg = []
+    row_lookup = {}
+    for jour_maj in jours_ordonnes:
+        jd = jours_dispo[jour_maj]
+        jour_cap = jour_maj.capitalize()  # 'MERCREDI' -> 'Mercredi', suffit ici
+        creneaux_jour = [(cren['debut'], cren['fin']) for cren in jd['creneaux']]
+        jours_arg.append({'jour': jour_cap, 'date': jd.get('date_str'),
+                           'creneaux': creneaux_jour})
+        for cren in jd['creneaux']:
+            row_lookup[(jour_cap, cren['debut'], cren['fin'])] = cren['row']
 
-        nom_agent_sheet = f'Semaine_{semaine_num}_Agent'
-        if nom_agent_sheet in wb.sheetnames:
-            ancien_index = wb.sheetnames.index(nom_agent_sheet)
-            del wb[nom_agent_sheet]
-        else:
-            ancien_index = wb.sheetnames.index(f'Semaine_{semaine_num}') + 1
+    nom_agent_sheet = f'Semaine_{semaine_num}_Agent'
+    if nom_agent_sheet in wb.sheetnames:
+        ancien_index = wb.sheetnames.index(nom_agent_sheet)
+        del wb[nom_agent_sheet]
+    else:
+        ancien_index = wb.sheetnames.index(f'Semaine_{semaine_num}') + 1
 
-        generer_vue_agent(wb, semaine_num, jours_arg, row_lookup, agents_recap_vue_agent,
-                           horaires_agents, pause_flex, lecture_resultat['evenements_regeneres'])
-        # generer_vue_agent recrée l'onglet à la FIN du classeur — on le
-        # replace à sa position d'origine (juste après Semaine_N).
-        nouvel_onglet = wb[nom_agent_sheet]
-        wb._sheets.remove(nouvel_onglet)
-        wb._sheets.insert(ancien_index, nouvel_onglet)
-        agent_sheet_reconstruit = True
+    generer_vue_agent(wb, semaine_num, jours_arg, row_lookup, agents_recap_vue_agent,
+                       horaires_agents, pause_flex, lecture_resultat['evenements_tous_jours'])
+    # generer_vue_agent recrée l'onglet à la FIN du classeur — on le
+    # replace à sa position d'origine (juste après Semaine_N).
+    nouvel_onglet = wb[nom_agent_sheet]
+    wb._sheets.remove(nouvel_onglet)
+    wb._sheets.insert(ancien_index, nouvel_onglet)
+    agent_sheet_reconstruit = True
 
     # ── 3. Alertes visuelles sur les conflits entre éléments fixes ─────
     conflits = calcul_resultat.get('conflits_a_signaler', [])
