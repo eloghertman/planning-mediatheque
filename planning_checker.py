@@ -334,17 +334,21 @@ def charger_donnees_preparation(wb):
 
     # Horaires agents : grille collaborative "horaires d'équipes" en priorité
     # (détectée par sa mise en page, peu importe le nom de l'onglet — cf.
-    # _detecter_grille_horaires_dans_classeur ci-dessus), repli sur l'ancienne
-    # liste à plat '_prep_Horaires_Des_Agents' si la grille est absente.
+    # _detecter_grille_horaires_dans_classeur ci-dessus, testé et confirmé
+    # tolérant à tout nom d'onglet, ex. "horaires_des_agents" — demande
+    # utilisatrice 24/08, voir §25.11), repli sur l'ancienne liste à plat
+    # 'Horaires_Des_Agents' (visible ou '_prep_...', insensible à la casse)
+    # si la grille est absente.
     horaires_source_trouvee = False
     nom_grille = _detecter_grille_horaires_dans_classeur(wb)
     if nom_grille is not None:
         raw[ONGLET_HORAIRES_GRILLE] = wb[nom_grille]
         horaires_source_trouvee = True
     else:
-        trouve_prefixe = _trouver_onglet_insensible_casse(wb, ONGLETS_PREP_PREFIXE + 'Horaires_Des_Agents')
-        if trouve_prefixe is not None:
-            raw['Horaires_Des_Agents'] = wb[trouve_prefixe]
+        trouve = (_trouver_onglet_insensible_casse(wb, 'Horaires_Des_Agents')
+                  or _trouver_onglet_insensible_casse(wb, ONGLETS_PREP_PREFIXE + 'Horaires_Des_Agents'))
+        if trouve is not None:
+            raw['Horaires_Des_Agents'] = wb[trouve]
             horaires_source_trouvee = True
 
     if not raw:
