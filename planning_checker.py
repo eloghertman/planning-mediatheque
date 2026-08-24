@@ -275,6 +275,22 @@ def _detecter_grille_horaires_dans_classeur(wb):
     return None
 
 
+def _trouver_onglet_insensible_casse(wb, nom):
+    """Retrouve un onglet par son nom, insensible à la casse. Nécessaire pour
+    'Planning_type' : le générateur écrit ce nom avec un P majuscule depuis
+    une certaine version, mais des fichiers plus anciens (et donc encore en
+    circulation) l'ont créé en 'planning_type' minuscule — confirmé le 24/08
+    en test réel (Elo a eu 'Onglet manquant : Planning_type' alors qu'il
+    était bien présent, juste minuscule). generate_planning_excel_septembre.py
+    tolère déjà les deux casses en LECTURE du fichier de préparation
+    (`raw.get('Planning_type') or raw.get('planning_type')`) ; cette fonction
+    apporte la même tolérance ici, côté lecture d'un planning déjà généré."""
+    for n in wb.sheetnames:
+        if n.lower() == nom.lower():
+            return n
+    return None
+
+
 def charger_donnees_preparation(wb):
     """Cherche les onglets de préparation dans le classeur, et si présents,
     retourne un dict avec toutes les données de préparation parsées via les
@@ -298,13 +314,23 @@ def charger_donnees_preparation(wb):
         if nom == 'Horaires_Des_Agents':
             continue  # traité séparément ci-dessous (grille en priorité, repli liste à plat)
         # Onglet visible en priorité (Planning_type, Paramètres, Affectations) ;
+        # recherche insensible à la casse (cf. _trouver_onglet_insensible_casse,
+        # nécessaire pour 'Planning_type' — voir §25.9 du contexte projet) ;
         # sinon repli sur la version masquée '_prep_...' — couvre à la fois
         # les nouveaux fichiers (visibles) et les anciens déjà générés
         # (masqués uniquement, avant ce changement).
-        if nom in ONGLETS_PREP_SANS_PREFIXE and nom in wb.sheetnames:
-            raw[nom] = wb[nom]
-        elif (ONGLETS_PREP_PREFIXE + nom) in wb.sheetnames:
-            raw[nom] = wb[ONGLETS_PREP_PREFIXE + nom]
+        if nom in ONGLETS_PREP_SANS_PREFIXE:
+            trouve = _trouver_onglet_insensible_casse(wb, nom)
+            if trouve is not None:
+                raw[nom] = wb[trouve]
+            else:
+                trouve_prefixe = _trouver_onglet_insensible_casse(wb, ONGLETS_PREP_PREFIXE + nom)
+                if trouve_prefixe is not None:
+                    raw[nom] = wb[trouve_prefixe]
+        else:
+            trouve_prefixe = _trouver_onglet_insensible_casse(wb, ONGLETS_PREP_PREFIXE + nom)
+            if trouve_prefixe is not None:
+                raw[nom] = wb[trouve_prefixe]
 
     # Horaires agents : grille collaborative "horaires d'équipes" en priorité
     # (détectée par sa mise en page, peu importe le nom de l'onglet — cf.
@@ -315,9 +341,11 @@ def charger_donnees_preparation(wb):
     if nom_grille is not None:
         raw[ONGLET_HORAIRES_GRILLE] = wb[nom_grille]
         horaires_source_trouvee = True
-    elif (ONGLETS_PREP_PREFIXE + 'Horaires_Des_Agents') in wb.sheetnames:
-        raw['Horaires_Des_Agents'] = wb[ONGLETS_PREP_PREFIXE + 'Horaires_Des_Agents']
-        horaires_source_trouvee = True
+    else:
+        trouve_prefixe = _trouver_onglet_insensible_casse(wb, ONGLETS_PREP_PREFIXE + 'Horaires_Des_Agents')
+        if trouve_prefixe is not None:
+            raw['Horaires_Des_Agents'] = wb[trouve_prefixe]
+            horaires_source_trouvee = True
 
     if not raw:
         return None
@@ -904,21 +932,21 @@ def verifier_planning(file_bytes):
             'Mode dégradé partiel'))
 
     semaine_sheets = sorted(
-        [n for n in wb.sheetnames if re.match(r'^Semaine_\d+$', n)],
+        [n for n in wb.sheetnames if re.match(r'^Semaine_\d+$', n, re.IGNORECASE)],
         key=lambda n: int(re.search(r'\d+', n).group())
     )
 
     for sn in semaine_sheets:
         ws = wb[sn]
         semaine_num = int(re.search(r'\d+', sn).group())
-        agent_sheet_name = f"{sn}_Agent"
+        agent_sheet_name = _trouver_onglet_insensible_casse(wb, f"{sn}_Agent")
         vue_agent = {}
-        if agent_sheet_name in wb.sheetnames:
+        if agent_sheet_name is not None:
             vue_agent = lire_vue_agent(wb[agent_sheet_name])
         elif not prep.get('horaires_agents'):
             anomalies.append(Anomalie(
                 'jaune', sn, '',
-                f"L'onglet '{agent_sheet_name}' est introuvable : les horaires contractuels "
+                f"L'onglet '{sn}_Agent' est introuvable : les horaires contractuels "
                 f"(règle 'arrivée/départ') n'ont pas pu être vérifiés pour cette semaine.",
                 'Fichier incomplet'))
 

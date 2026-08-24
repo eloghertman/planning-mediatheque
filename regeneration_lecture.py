@@ -43,6 +43,7 @@ from planning_checker import (
     lire_jours_semaine, construire_occurrences_jour, fusionner_occurrences,
     charger_donnees_preparation, JOUR_CAPITALISE,
     est_ignore, est_eloise, ALL_AGENTS_CONNUS,
+    _trouver_onglet_insensible_casse,
 )
 
 import openpyxl
@@ -122,10 +123,10 @@ def lire_planning_pour_regeneration(file_bytes, semaine_num, jours_a_regenerer):
     """
     wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
 
-    nom_onglet = f'Semaine_{semaine_num}'
-    if nom_onglet not in wb.sheetnames:
+    nom_onglet = _trouver_onglet_insensible_casse(wb, f'Semaine_{semaine_num}')
+    if nom_onglet is None:
         raise ErreurRegeneration(
-            f"Je ne trouve pas d'onglet '{nom_onglet}' dans ce fichier. "
+            f"Je ne trouve pas d'onglet 'Semaine_{semaine_num}' dans ce fichier. "
             f"Onglets présents : {', '.join(wb.sheetnames)}."
         )
     ws = wb[nom_onglet]

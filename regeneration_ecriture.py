@@ -37,7 +37,7 @@ from openpyxl.comments import Comment
 from generate_planning_excel_septembre import (
     agent_cell_style, fmt_agents, GREY_BORDER, generer_vue_agent, is_vacataire,
 )
-from planning_checker import JOURS_ORDRE
+from planning_checker import JOURS_ORDRE, _trouver_onglet_insensible_casse
 
 BORDURE_ALERTE = Border(*[Side(style='thick', color='FFE74C3C')] * 4)
 
@@ -129,7 +129,8 @@ def ecrire_regeneration(file_bytes, lecture_resultat, calcul_resultat):
     n'est jamais modifié en place)."""
     wb = openpyxl.load_workbook(BytesIO(file_bytes))  # data_only=False : on garde les formules
     semaine_num = lecture_resultat['semaine_num']
-    ws = wb[f'Semaine_{semaine_num}']
+    nom_onglet = _trouver_onglet_insensible_casse(wb, f'Semaine_{semaine_num}')
+    ws = wb[nom_onglet]
     jours_dispo = lecture_resultat['jours_data_bruts']
 
     jours_infaisables = []
@@ -200,11 +201,12 @@ def ecrire_regeneration(file_bytes, lecture_resultat, calcul_resultat):
             row_lookup[(jour_cap, cren['debut'], cren['fin'])] = cren['row']
 
     nom_agent_sheet = f'Semaine_{semaine_num}_Agent'
-    if nom_agent_sheet in wb.sheetnames:
-        ancien_index = wb.sheetnames.index(nom_agent_sheet)
-        del wb[nom_agent_sheet]
+    ancien_agent_sheet = _trouver_onglet_insensible_casse(wb, nom_agent_sheet)
+    if ancien_agent_sheet is not None:
+        ancien_index = wb.sheetnames.index(ancien_agent_sheet)
+        del wb[ancien_agent_sheet]
     else:
-        ancien_index = wb.sheetnames.index(f'Semaine_{semaine_num}') + 1
+        ancien_index = wb.sheetnames.index(nom_onglet) + 1
 
     generer_vue_agent(wb, semaine_num, jours_arg, row_lookup, agents_recap_vue_agent,
                        horaires_agents, pause_flex, lecture_resultat['evenements_tous_jours'])
