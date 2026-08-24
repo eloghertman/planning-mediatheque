@@ -465,7 +465,13 @@ st.markdown(
     "ce fichier sont utilisés tels quels pour le recalcul. Si tu as besoin "
     "de les modifier avant de relancer, il faut d'abord les déverrouiller "
     "dans Excel (clic droit sur l'onglet → Ôter la protection de la "
-    "feuille, aucun mot de passe requis)."
+    "feuille, aucun mot de passe requis).\n\n"
+    "✏️ Les onglets 'Paramètres' et 'Affectations', eux, sont directement "
+    "modifiables (pas besoin de les déverrouiller) — utile par exemple pour "
+    "ajouter une nouvelle section à un agent nouvellement formé en cours de "
+    "mois. Modifie-les dans Excel, enregistre, puis dépose ce fichier "
+    "ci-dessous et choisis les jours à régénérer à partir de la date du "
+    "changement."
 )
 
 f_planning_regen = st.file_uploader(

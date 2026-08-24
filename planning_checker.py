@@ -22,11 +22,20 @@ from planning_engine_cpsat import (
     parse_roulement_samedi, agent_disponible, is_vacataire, _parse_fr_date,
     parse_planning_type, parse_besoins_jeunesse, parse_jours_speciaux,
     parse_creneau as parse_creneau_engine,
+    parse_horaires_agents_grille, ONGLET_HORAIRES_GRILLE,
 )
 
 # Onglets de préparation recopiés (très masqués) par generate_planning_excel_septembre.py
 # (fonction copier_onglets_preparation_caches). Préfixe '_prep_' + nom d'origine.
 ONGLETS_PREP_PREFIXE = '_prep_'
+# Onglets recopiés en VISIBLE (sans préfixe '_prep_') plutôt qu'en très masqué :
+# 'Planning_type' et "horaires d'équipes" (consultables, verrouillés) depuis
+# 09/2026 ; 'Paramètres' et 'Affectations' (modifiables) depuis 08/2026, pour
+# permettre les mises à jour en cours de mois (ex. nouvelle habilitation
+# d'un agent) suivies d'une régénération partielle (bloc 4). Repli automatique
+# sur la version masquée '_prep_...' pour les fichiers générés par une version
+# antérieure de l'outil (voir boucle ci-dessous).
+ONGLETS_PREP_SANS_PREFIXE = {'Planning_type', 'Paramètres', 'Affectations'}
 ONGLETS_PREP_NOMS = [
     'Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi',
     # Ajoutés (09/2026) : nécessaires à la vérification de la couverture
@@ -246,37 +255,86 @@ class Anomalie:
 #  DONNÉES DE PRÉPARATION (onglets '_prep_...' très masqués, si présents)
 # ─────────────────────────────────────────────────────────────
 
+def _detecter_grille_horaires_dans_classeur(wb):
+    """Retrouve, dans un classeur DÉJÀ GÉNÉRÉ (planning final), l'onglet
+    grille "horaires d'équipes" par sa mise en page (case A6='ADULTES',
+    H6='JEUNESSE') plutôt que par son nom d'onglet — même principe que la
+    détection déjà faite côté fichier de préparation par
+    planning_engine_cpsat.py (_detecter_onglet_horaires_grille), pour rester
+    tolérant si l'onglet est renommé dans le planning généré (ex. Elo
+    l'appelle "planning_agent"). Retourne le nom de l'onglet trouvé, ou None."""
+    for nom in wb.sheetnames:
+        ws = wb[nom]
+        try:
+            a6 = normalize(ws.cell(row=6, column=1).value or '')
+            h6 = normalize(ws.cell(row=6, column=8).value or '')
+        except Exception:
+            continue
+        if a6 == 'adultes' and h6 == 'jeunesse':
+            return nom
+    return None
+
+
 def charger_donnees_preparation(wb):
     """Cherche les onglets de préparation dans le classeur, et si présents,
     retourne un dict avec toutes les données de préparation parsées via les
     mêmes fonctions que le moteur de calcul (planning_engine_cpsat.py) —
     même lecture, même vérité.
     La plupart de ces onglets sont recopiés en '_prep_...' très masqués
-    (usage interne uniquement). 'Planning_type' fait exception (demande
-    utilisatrice 09/2026) : il est recopié en onglet VISIBLE et verrouillé
-    nommé directement 'Planning_type' (sans préfixe '_prep_'), afin que les
-    agents puissent le consulter dans Excel — on le cherche donc sous son
-    nom tel quel plutôt que sous sa version masquée.
+    (usage interne uniquement). Quatre exceptions, recopiées en onglet
+    VISIBLE nommé directement sans préfixe '_prep_' : 'Planning_type' et
+    "horaires d'équipes" (demande utilisatrice 09/2026, consultables mais
+    verrouillés) ; 'Paramètres' et 'Affectations' (demande utilisatrice
+    08/2026, librement modifiables — cf. régénération partielle, bloc 4).
+    On les cherche donc sous leur nom tel quel en priorité, avec repli sur
+    la version masquée '_prep_...' pour les fichiers générés par une
+    version antérieure de l'outil.
     Retourne None si aucun onglet de préparation n'est présent (fichier
     généré avec une version antérieure de generate_planning_excel_septembre.py) :
     dans ce cas, verifier_planning() se rabat sur une vérification
     approximative à partir de la 'vue par agent' seule."""
     raw = {}
     for nom in ONGLETS_PREP_NOMS + [ONGLET_JOURS_SPECIAUX]:
-        onglet = nom if nom == 'Planning_type' else ONGLETS_PREP_PREFIXE + nom
-        if onglet in wb.sheetnames:
-            raw[nom] = wb[onglet]
+        if nom == 'Horaires_Des_Agents':
+            continue  # traité séparément ci-dessous (grille en priorité, repli liste à plat)
+        # Onglet visible en priorité (Planning_type, Paramètres, Affectations) ;
+        # sinon repli sur la version masquée '_prep_...' — couvre à la fois
+        # les nouveaux fichiers (visibles) et les anciens déjà générés
+        # (masqués uniquement, avant ce changement).
+        if nom in ONGLETS_PREP_SANS_PREFIXE and nom in wb.sheetnames:
+            raw[nom] = wb[nom]
+        elif (ONGLETS_PREP_PREFIXE + nom) in wb.sheetnames:
+            raw[nom] = wb[ONGLETS_PREP_PREFIXE + nom]
+
+    # Horaires agents : grille collaborative "horaires d'équipes" en priorité
+    # (détectée par sa mise en page, peu importe le nom de l'onglet — cf.
+    # _detecter_grille_horaires_dans_classeur ci-dessus), repli sur l'ancienne
+    # liste à plat '_prep_Horaires_Des_Agents' si la grille est absente.
+    horaires_source_trouvee = False
+    nom_grille = _detecter_grille_horaires_dans_classeur(wb)
+    if nom_grille is not None:
+        raw[ONGLET_HORAIRES_GRILLE] = wb[nom_grille]
+        horaires_source_trouvee = True
+    elif (ONGLETS_PREP_PREFIXE + 'Horaires_Des_Agents') in wb.sheetnames:
+        raw['Horaires_Des_Agents'] = wb[ONGLETS_PREP_PREFIXE + 'Horaires_Des_Agents']
+        horaires_source_trouvee = True
+
     if not raw:
         return None
 
-    donnees = {'manquants': [n for n in ONGLETS_PREP_NOMS if n not in raw]}
+    manquants = [n for n in ONGLETS_PREP_NOMS if n != 'Horaires_Des_Agents' and n not in raw]
+    if not horaires_source_trouvee:
+        manquants.append('Horaires_Des_Agents')
+    donnees = {'manquants': manquants}
     try:
         if 'Paramètres' in raw:
             donnees['params'] = parse_parametres(raw)
         if 'Affectations' in raw:
             (donnees['affectations'], donnees['categories'], donnees['responsables'],
              donnees['pause_flex'], donnees['priorite_rdc']) = parse_affectations(raw)
-        if 'Horaires_Des_Agents' in raw:
+        if ONGLET_HORAIRES_GRILLE in raw:
+            donnees['horaires_agents'] = parse_horaires_agents_grille(raw)
+        elif 'Horaires_Des_Agents' in raw:
             donnees['horaires_agents'] = parse_horaires_agents(raw)
         if 'Roulement_Samedi' in raw:
             donnees['roulement_type'], donnees['roulement_exceptions'] = parse_roulement_samedi(raw)

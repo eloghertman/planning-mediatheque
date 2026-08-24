@@ -984,6 +984,8 @@ def generer(input_path=None, output_path=None):
     # cellules seraient déverrouillées par la passe générique ci-dessus.
     embarquer_planning_type_visible(wb, raw)
     embarquer_horaires_agents_visible(wb, raw)
+    embarquer_parametres_visible(wb, raw)
+    embarquer_affectations_visible(wb, raw)
     wb.save(output_path)
     print('Fichier genere:', output_path)
     return output_path, weeks_data, metadata
@@ -1003,15 +1005,19 @@ def generer(input_path=None, output_path=None):
 # colonnes Accueil/Animation/Réunion/Absence (H/I/J) et les notes agents
 # (colonnes W-Z) du planning lui-même.
 ONGLETS_PREPARATION_A_RECOPIER = [
-    'Paramètres', 'Affectations', 'Roulement_Samedi',
+    'Roulement_Samedi',
     # Ajoutés (09/2026, demande utilisatrice) : nécessaires à planning_checker.py
     # pour vérifier la contrainte dure "nombre d'agents Jeunesse = planning type
     # (hors vacances) / Besoins_Jeunesse (vacances scolaires)", ainsi que la
     # couverture RDC/Adulte/M&F par rapport au planning type.
-    # NB : ni 'Planning_type' ni "horaires d'équipes" ne sont dans cette liste
-    # — ils sont recopiés à part, en onglet VISIBLE et verrouillé (cf.
-    # embarquer_planning_type_visible / embarquer_horaires_agents_visible),
-    # pas en très masqué, car les agents doivent pouvoir les consulter.
+    # NB : ni 'Planning_type', ni "horaires d'équipes", ni 'Paramètres', ni
+    # 'Affectations' ne sont dans cette liste — ils sont recopiés à part, en
+    # onglet VISIBLE (cf. embarquer_planning_type_visible /
+    # embarquer_horaires_agents_visible / embarquer_parametres_visible /
+    # embarquer_affectations_visible), pas en très masqué, car les agents
+    # doivent pouvoir les consulter (Planning_type, horaires d'équipes) ou
+    # même les modifier en cours de mois (Paramètres, Affectations —
+    # demande utilisatrice 08/2026, cf. régénération partielle).
     'Besoins_Jeunesse', 'Jours_speciaux',
 ]
 
@@ -1125,40 +1131,79 @@ def embarquer_planning_type_visible(wb, raw):
 
 def embarquer_horaires_agents_visible(wb, raw):
     """Recopie l'onglet "horaires d'équipes" (grille collaborative) en onglet
-    VISIBLE et verrouillé dans le planning généré — même principe que
-    embarquer_planning_type_visible ci-dessus (demande utilisatrice 08/2026) :
-    les agents doivent pouvoir consulter leurs horaires contractuels
-    directement dans le fichier généré, sous la forme familière (fiches par
-    agent), plutôt que via une liste à plat masquée.
+    VISIBLE et MODIFIABLE (demande utilisatrice 08/2026 : Elo doit pouvoir
+    corriger un horaire d'agent en cours de mois — ex. changement de
+    contrat — directement dans le planning généré, puis relancer une
+    régénération partielle (bloc 4) qui relira ces valeurs telles quelles.
+    Avant cette date, cet onglet était recopié verrouillé, en lecture seule
+    — comme Planning_type ; ce n'est plus le cas, voir
+    _embarquer_prep_visible_modifiable ci-dessous, réutilisée ici).
 
     Le formatage d'origine (couleurs, hachures des demi-journées non
     travaillées, polices, colonnes fusionnées, largeurs...) est conservé à
-    l'identique. Verrouillage sans mot de passe, dans le même esprit que pour
-    Planning_type : on protège des fausses manipulations, pas d'un usage
-    volontaire.
+    l'identique.
 
     IMPORTANT : comme pour Planning_type, doit être appelée APRÈS
-    verrouiller_cellules_formules(wb) — sinon celle-ci déverrouillerait les
-    cellules sans formule de ce nouvel onglet."""
-    ws_src = raw.get(ONGLET_HORAIRES_GRILLE)
+    verrouiller_cellules_formules(wb) — sinon celle-ci verrouillerait les
+    cellules de formule (totaux jour/semaine) de ce nouvel onglet."""
+    _embarquer_prep_visible_modifiable(wb, raw, ONGLET_HORAIRES_GRILLE)
+
+
+def _embarquer_prep_visible_modifiable(wb, raw, nom_source):
+    """Recopie un onglet de préparation en onglet VISIBLE et MODIFIABLE
+    (demande utilisatrice 08/2026, cas Paramètres/Affectations) : contrairement
+    à embarquer_planning_type_visible / embarquer_horaires_agents_visible (qui
+    verrouillent TOUTES les cellules — 'vitre', on regarde sans toucher), ici
+    on protège seulement la STRUCTURE de la feuille (pas d'insertion/suppression
+    de ligne ou colonne intempestive) mais on laisse TOUTES les cellules
+    déverrouillées : la personne doit pouvoir taper directement dedans en
+    cours de mois (ex. ajouter une nouvelle section habilitée pour un agent
+    nouvellement formé) et relancer une régénération partielle (bloc 4) qui
+    relira ces valeurs telles quelles. Pas de mot de passe, même esprit que
+    verrouiller_cellules_formules : on protège des fausses manipulations de
+    structure, pas d'un usage volontaire de saisie.
+
+    Le formatage d'origine est conservé (mêmes largeurs de colonnes, etc.).
+
+    IMPORTANT : comme pour Planning_type, à appeler APRÈS
+    verrouiller_cellules_formules(wb) — sinon celle-ci verrouillerait certaines
+    cellules par erreur si l'onglet source contenait des formules."""
+    ws_src = raw.get(nom_source)
     if ws_src is None:
         return
-    nom_cible = (ONGLET_HORAIRES_GRILLE if ONGLET_HORAIRES_GRILLE not in wb.sheetnames
-                 else f'{ONGLET_HORAIRES_GRILLE} (référence)')
+    nom_cible = nom_source if nom_source not in wb.sheetnames else f'{nom_source} (référence)'
     ws_dst = wb.create_sheet(nom_cible)
     _copier_feuille_avec_mise_en_forme(ws_src, ws_dst)
     for row in ws_dst.iter_rows():
         for cell in row:
-            # Comme pour Planning_type : le style (déjà posé ci-dessus) n'est
-            # pas touché, on ajoute seulement le verrouillage.
-            cell.protection = Protection(locked=True)
+            cell.protection = Protection(locked=False)
     ws_dst.protection.sheet = True
     ws_dst.protection.formatCells = False
     ws_dst.protection.formatColumns = False
     ws_dst.protection.formatRows = False
+    ws_dst.protection.insertRows = False
+    ws_dst.protection.insertColumns = False
+    ws_dst.protection.deleteRows = False
+    ws_dst.protection.deleteColumns = False
     ws_dst.protection.sort = False
     ws_dst.protection.autoFilter = False
     ws_dst.sheet_state = 'visible'
+
+
+def embarquer_parametres_visible(wb, raw):
+    """Paramètres : voir _embarquer_prep_visible_modifiable — onglet visible,
+    structure protégée, contenu librement modifiable (mois/année, créneaux,
+    couleurs samedi, présences vacataires...)."""
+    _embarquer_prep_visible_modifiable(wb, raw, 'Paramètres')
+
+
+def embarquer_affectations_visible(wb, raw):
+    """Affectations : voir _embarquer_prep_visible_modifiable — onglet visible,
+    structure protégée, contenu librement modifiable (sections habilitées par
+    agent, catégorie, responsable, pause flexible...). Cas d'usage typique :
+    un agent nouvellement formé sur une section en cours de mois, à répercuter
+    via une régénération partielle (bloc 4) sur les jours restants."""
+    _embarquer_prep_visible_modifiable(wb, raw, 'Affectations')
 
 
 def grille_fine_commune(jours):

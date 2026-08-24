@@ -7,7 +7,8 @@ Rôle de cette brique : NE RIEN CALCULER. Juste lire un planning déjà rempli
 jours de cette semaine, tout ce dont la brique 2 (recalcul CP-SAT) aura
 besoin :
 
-1. Les règles (mêmes onglets cachés _prep_* que le Bloc 3, même lecture).
+1. Les règles (mêmes onglets de préparation que le Bloc 3, même lecture —
+   Planning_type/Paramètres/Affectations visibles, le reste en _prep_*).
 2. Les "contraintes figées" du/des jour(s) à régénérer : tout ce qui est
    déjà noté en Accueil/Réunion/Absence (H/I/J) + notes agents (W-Z) —
    converties au même format que les "événements" que le moteur CP-SAT
@@ -133,11 +134,12 @@ def lire_planning_pour_regeneration(file_bytes, semaine_num, jours_a_regenerer):
     prep = charger_donnees_preparation(wb)
     if prep is None:
         raise ErreurRegeneration(
-            "Ce fichier ne contient pas les onglets de préparation cachés "
-            "(_prep_...). Il a probablement été généré avec une ancienne "
-            "version de l'outil, ou ces onglets ont été supprimés. La "
-            "régénération partielle a besoin de ces règles pour fonctionner "
-            "— impossible de continuer avec ce fichier."
+            "Ce fichier ne contient pas les onglets de préparation "
+            "(Paramètres, Affectations, _prep_..., etc.). Il a probablement "
+            "été généré avec une ancienne version de l'outil, ou ces "
+            "onglets ont été supprimés. La régénération partielle a besoin "
+            "de ces règles pour fonctionner — impossible de continuer avec "
+            "ce fichier."
         )
     if 'erreur_lecture' in prep:
         raise ErreurRegeneration(
