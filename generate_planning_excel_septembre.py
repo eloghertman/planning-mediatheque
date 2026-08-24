@@ -1143,27 +1143,69 @@ def embarquer_horaires_agents_visible(wb, raw):
     travaillées, polices, colonnes fusionnées, largeurs...) est conservé à
     l'identique.
 
+    `verrouiller_formules=True` (demande utilisatrice 24/08) : contrairement
+    à Paramètres/Affectations (aucune formule), cette grille contient ~105
+    formules de totaux jour/semaine — les laisser déverrouillées comme le
+    reste exposerait à un écrasement accidentel en tapant à côté d'une case
+    de saisie. Seules CES cellules-là sont reverrouillées après coup ; les
+    cases de saisie des horaires restent, elles, librement modifiables.
+
     IMPORTANT : comme pour Planning_type, doit être appelée APRÈS
     verrouiller_cellules_formules(wb) — sinon celle-ci verrouillerait les
     cellules de formule (totaux jour/semaine) de ce nouvel onglet."""
-    _embarquer_prep_visible_modifiable(wb, raw, ONGLET_HORAIRES_GRILLE)
+    _embarquer_prep_visible_modifiable(wb, raw, ONGLET_HORAIRES_GRILLE, verrouiller_formules=True)
 
 
-def _embarquer_prep_visible_modifiable(wb, raw, nom_source):
+def _normaliser_dates_visibles(ws):
+    """Corrige un défaut d'affichage découvert le 24/08 (demande
+    utilisatrice) : une cellule contenant une vraie date Excel, mais dont le
+    format numérique inclut l'heure (ex. 'yyyy-mm-dd h:mm:ss', 19
+    caractères) tient rarement dans une largeur de colonne raisonnable et
+    s'affiche en '#######' — invisible tant que l'onglet était très masqué,
+    devenu gênant maintenant qu'il est visible (cas rencontré : tableau
+    Présence Vacataire de Paramètres). Uniforme avec le format déjà utilisé
+    par Elo dans son fichier de préparation ('d-mmm-yy', ex. '5-sept-26').
+    Ne touche PAS aux cellules d'heure pure (datetime.time) ni aux durées
+    (timedelta) — seulement aux vraies dates (datetime.date/datetime), donc
+    sans effet sur les colonnes d'horaires de la grille "horaires
+    d'équipes"."""
+    import datetime as _dt
+    colonnes_a_elargir = set()
+    for row in ws.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, _dt.date) and not isinstance(cell.value, _dt.time):
+                cell.number_format = 'd-mmm-yy'
+                colonnes_a_elargir.add(cell.column_letter)
+    for col_letter in colonnes_a_elargir:
+        dim = ws.column_dimensions[col_letter]
+        if dim.width is None or dim.width < 16:
+            dim.width = 16
+
+
+def _embarquer_prep_visible_modifiable(wb, raw, nom_source, verrouiller_formules=False):
     """Recopie un onglet de préparation en onglet VISIBLE et MODIFIABLE
     (demande utilisatrice 08/2026, cas Paramètres/Affectations) : contrairement
-    à embarquer_planning_type_visible / embarquer_horaires_agents_visible (qui
-    verrouillent TOUTES les cellules — 'vitre', on regarde sans toucher), ici
-    on protège seulement la STRUCTURE de la feuille (pas d'insertion/suppression
-    de ligne ou colonne intempestive) mais on laisse TOUTES les cellules
-    déverrouillées : la personne doit pouvoir taper directement dedans en
-    cours de mois (ex. ajouter une nouvelle section habilitée pour un agent
-    nouvellement formé) et relancer une régénération partielle (bloc 4) qui
-    relira ces valeurs telles quelles. Pas de mot de passe, même esprit que
-    verrouiller_cellules_formules : on protège des fausses manipulations de
-    structure, pas d'un usage volontaire de saisie.
+    à embarquer_planning_type_visible (qui verrouille TOUTES les cellules —
+    'vitre', on regarde sans toucher), ici on protège seulement la STRUCTURE
+    de la feuille (pas d'insertion/suppression de ligne ou colonne
+    intempestive) mais on laisse les cellules déverrouillées : la personne
+    doit pouvoir taper directement dedans en cours de mois (ex. ajouter une
+    nouvelle section habilitée pour un agent nouvellement formé) et relancer
+    une régénération partielle (bloc 4) qui relira ces valeurs telles
+    quelles. Pas de mot de passe, même esprit que verrouiller_cellules_formules :
+    on protège des fausses manipulations de structure, pas d'un usage
+    volontaire de saisie.
 
-    Le formatage d'origine est conservé (mêmes largeurs de colonnes, etc.).
+    `verrouiller_formules=True` (demande utilisatrice 24/08) : après avoir
+    tout déverrouillé, reverrouille spécifiquement les cellules qui
+    contiennent une formule (ex. totaux calculés dans "horaires d'équipes")
+    — même logique que verrouiller_cellules_formules(wb), appliquée
+    localement à cet onglet puisqu'il est créé après elle. Sans effet pour
+    Paramètres/Affectations, qui n'ont aucune formule.
+
+    Le formatage d'origine est conservé (mêmes largeurs de colonnes, etc.),
+    hormis la correction d'affichage des dates (voir
+    _normaliser_dates_visibles).
 
     IMPORTANT : comme pour Planning_type, à appeler APRÈS
     verrouiller_cellules_formules(wb) — sinon celle-ci verrouillerait certaines
@@ -1176,7 +1218,14 @@ def _embarquer_prep_visible_modifiable(wb, raw, nom_source):
     _copier_feuille_avec_mise_en_forme(ws_src, ws_dst)
     for row in ws_dst.iter_rows():
         for cell in row:
-            cell.protection = Protection(locked=False)
+            if verrouiller_formules:
+                is_formula = isinstance(cell.value, ArrayFormula) or (
+                    isinstance(cell.value, str) and cell.value.startswith('=')
+                )
+                cell.protection = Protection(locked=is_formula)
+            else:
+                cell.protection = Protection(locked=False)
+    _normaliser_dates_visibles(ws_dst)
     ws_dst.protection.sheet = True
     ws_dst.protection.formatCells = False
     ws_dst.protection.formatColumns = False
