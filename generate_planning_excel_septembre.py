@@ -427,12 +427,11 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
     """Ajoute, pour UNE journée, le petit tableau Nom/Événement (2 groupes de
     colonnes W/X et Y/Z), ses colonnes cachées d'analyse, et fait remonter
     automatiquement les notes vers H/I/J — ainsi que vers les colonnes
-    cachées R/S/T/U utilisées par la vue par agent (Accueil/Animation et
-    Réunion uniquement ; l'Absence de la vue par agent est calculée à part,
-    directement depuis les événements du fichier de préparation, donc une
-    note d'absence tapée ici ne remonte QUE dans le planning principal, pas
-    dans la vue par agent — limite connue, documentée dans le contexte
-    projet)."""
+    cachées R/S/T/U utilisées par la vue par agent. Depuis 09/2026, les 3
+    catégories (Réunion, Absence, Accueil/Animation) remontent dans la vue
+    par agent via la formule live de generer_vue_agent (note_cond) ; le
+    mot-clé "formation" est reconnu comme Absence (catégorie 2), au même
+    titre que "congé"/"absen"/"part"."""
     mid = (len(agents_14) + 1) // 2
     group1, group2 = agents_14[:mid], agents_14[mid:]
     thin = Side(style='thin', color='FFBFBFBF')
@@ -481,7 +480,7 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
             ws.cell(row=rr, column=cat_col, value=(
                 f'=IF({ref}="",0,'
                 f'IF(OR(ISNUMBER(SEARCH("réunion",{ref})),ISNUMBER(SEARCH("reunion",{ref})),ISNUMBER(SEARCH("rdv",{ref}))),1,'
-                f'IF(OR(ISNUMBER(SEARCH("congé",{ref})),ISNUMBER(SEARCH("conge",{ref})),ISNUMBER(SEARCH("absen",{ref})),ISNUMBER(SEARCH("part",{ref}))),2,'
+                f'IF(OR(ISNUMBER(SEARCH("congé",{ref})),ISNUMBER(SEARCH("conge",{ref})),ISNUMBER(SEARCH("absen",{ref})),ISNUMBER(SEARCH("part",{ref})),ISNUMBER(SEARCH("formation",{ref}))),2,'
                 f'3)))'
             ))
             ws.cell(row=rr, column=txt_col, value=(
@@ -1582,12 +1581,14 @@ def generer_vue_agent(wb, week_num, jours, row_lookup, agents_recap,
                 for col_src, label in reversed(SECTIONS_SRC):
                     inner = (f'IF(ISNUMBER(SEARCH("{agent_q}",\'{sheet_src}\'!${col_src}${src_row})),'
                               f'"{label}",{inner})')
-                # CORRECTIF 09/2026 : si une note W-Z (Réunion/Accueil) existe
-                # pour CET agent CE jour-là et que son horaire chevauche ce
-                # créneau fin, elle prend le pas sur RDC/Adulte/M&F/Jeunesse —
+                # CORRECTIF 09/2026 : si une note W-Z (Réunion/Accueil/Absence)
+                # existe pour CET agent CE jour-là et que son horaire chevauche
+                # ce créneau fin, elle prend le pas sur RDC/Adulte/M&F/Jeunesse —
                 # en formule, donc mise à jour automatique si la note est
                 # tapée/modifiée après la génération. Absence (catégorie 2)
-                # volontairement exclue (limite documentée, inchangée).
+                # incluse depuis 09/2026 (demande utilisatrice : les absences
+                # tapées en W-Z doivent aussi apparaître dans la vue par agent,
+                # pas seulement dans le planning principal).
                 note_pos = notes_pos.get((jour, agent))
                 if note_pos:
                     hstart, note_row = note_pos
@@ -1597,6 +1598,7 @@ def generer_vue_agent(wb, week_num, jours, row_lookup, agents_recap,
                     fin_c = get_column_letter(hstart + 3)
                     cs_h, ce_h = cs / 60, ce / 60
                     note_cond = (f"AND(OR('{sheet_src}'!${cat_c}${note_row}=1,"
+                                 f"'{sheet_src}'!${cat_c}${note_row}=2,"
                                  f"'{sheet_src}'!${cat_c}${note_row}=3),"
                                  f"'{sheet_src}'!${deb_c}${note_row}<{ce_h},"
                                  f"'{sheet_src}'!${fin_c}${note_row}>{cs_h})")
