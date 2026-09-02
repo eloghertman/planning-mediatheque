@@ -904,7 +904,27 @@ def generer(input_path=None, output_path=None):
                 row_lookup[(jour, cs, ce)] = r
                 r += 1
 
-            fusionner_cellules_identiques(ws, lignes_jour, valeurs_brutes, colonnes=range(8, 11),
+            # CORRECTIF 09/2026 (demande utilisatrice) : la colonne Absence (J,
+            # 10) n'est PLUS fusionnée verticalement sur la journée, contrairement
+            # à Accueil/Animation (H) et Réunion (I). Raison : une case fusionnée
+            # J valable pour toute la journée (ex. congé Christine/Delphine,
+            # 10h-19h) « avalait » ensuite, au moment de la cascade des notes
+            # W-Z (cf. ajouter_zone_notes_jour, group_new_part), toute absence
+            # tapée après coup pour un autre agent sur une PARTIE seulement de
+            # la journée (ex. Stéphane, 17h-19h) : le texte de la note atterrit
+            # sur l'ANCRE du gros bloc fusionné (la case du haut), qui visuel-
+            # lement recouvre 10h-19h — donnant l'impression (et, pour le
+            # Bloc 3, la fenêtre de calcul réelle en l'absence d'horaire
+            # explicite dans le texte affiché) que Stéphane est absent toute la
+            # journée. En laissant J non fusionnée, chaque créneau garde SA
+            # PROPRE case, donc SA PROPRE fenêtre horaire pour la cascade des
+            # notes (cf. _notes_blocks_for, qui traite alors chaque ligne comme
+            # un bloc isolé) : Stéphane n'apparaît plus que sur le(s) créneau(x)
+            # 17h-19h. Contrepartie acceptée : un congé qui dure toute la
+            # journée se retrouve répété sur chaque ligne de créneau, au lieu
+            # d'une seule case fusionnée — moins compact visuellement, mais sans
+            # ambiguïté sur qui est absent quand.
+            fusionner_cellules_identiques(ws, lignes_jour, valeurs_brutes, colonnes=range(8, 10),
                                            hidden_map={8: 'R', 9: 'S'})
             if lignes_jour:
                 ajouter_zone_notes_jour(ws, header_row, lignes_jour[0], lignes_jour[-1],
