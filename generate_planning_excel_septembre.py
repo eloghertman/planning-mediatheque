@@ -294,7 +294,17 @@ def write_row(ws, r, values, fills, bold=False, font_size=10, alert_headers=None
         else:
             cell.fill = PatternFill('solid', fgColor=fills[h])
         cell.border = GREY_BORDER
-        if discret:
+        # CORRECTIF 09/2026 : sur les jours à créneaux "discrets" (mar/jeu/
+        # ven), un événement réel (Accueil/Animation, Réunion, Absence) qui
+        # tombe sur un créneau fermé se retrouvait quand même en gris clair
+        # taille 8 comme le reste de la ligne fermée — illisible. Seules les
+        # colonnes VIDES ('—') restent en style discret ; une colonne
+        # d'événement qui contient effectivement du texte reprend le même
+        # style que partout ailleurs (noir, italique, taille 9).
+        est_evenement_avec_texte = (
+            h in ('Accueil / Animation', 'Réunion', 'Absence') and val
+        )
+        if discret and not est_evenement_avec_texte:
             # Créneaux sans service public (mar/jeu/ven) : discret, gris, italique
             cell.font = Font(size=8, italic=True, color='FF999999')
         elif not is_agent_col:
@@ -500,6 +510,57 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
         for c in (cat_col, txt_col, deb_col, fin_col):
             ws.column_dimensions[get_column_letter(c)].hidden = True
 
+    # ---- 2bis) colonne cachée "libellé fusionné" (09/2026, demande
+    # utilisatrice) : quand PLUSIEURS agents tapent le même événement au même
+    # horaire (ex. Stéphanie, Robin et Agnès notent chacun·e "13h30-15h
+    # réunion"), on ne veut qu'UNE seule entrée dans la colonne H/I/J, avec
+    # tous les prénoms regroupés — "Réunion (Stéphanie, Robin, Agnès)" — au
+    # lieu d'une entrée répétée par agent. Principe : pour CHAQUE ligne de
+    # note (les deux groupes W/X et Y/Z confondus), on calcule ici le libellé
+    # complet avec tous les prénoms concernés, mais on ne le garde que sur la
+    # PREMIÈRE ligne (dans l'ordre groupe 1 puis groupe 2) parmi celles qui
+    # partagent exactement le même texte et le même horaire ; les autres
+    # lignes concernées restent vides (elles sont déjà comptées dans le
+    # libellé de la première). La cascade H/I/J (étape 4bis, plus bas) ne lit
+    # plus que cette colonne, donc les doublons disparaissent naturellement.
+    # Volontairement des formules "normales" (pas matricielles) : chaque
+    # argument de TEXTJOIN référence une cellule précise, jamais une plage,
+    # donc pas besoin de validation matricielle (Ctrl+Maj+Entrée) — plus
+    # robuste, notamment sous LibreOffice.
+    entries = []
+    for nom_col, note_col, group in groups:
+        hstart = NOTES_HELPER_START[note_col]
+        cat_col, txt_col, deb_col, fin_col = hstart, hstart + 1, hstart + 2, hstart + 3
+        lbl_col = hstart + 4
+        for i in range(len(group)):
+            rr = header_row + 1 + i
+            entries.append({
+                'cat': f'{get_column_letter(cat_col)}{rr}',
+                'txt': f'{get_column_letter(txt_col)}{rr}',
+                'deb': f'{get_column_letter(deb_col)}{rr}',
+                'fin': f'{get_column_letter(fin_col)}{rr}',
+                'nom': f'{get_column_letter(nom_col)}{rr}',
+                'lbl_col': lbl_col, 'rr': rr,
+            })
+        ws.column_dimensions[get_column_letter(lbl_col)].hidden = True
+
+    for k, own in enumerate(entries):
+        all_ifs = []
+        earlier_terms = []
+        for j, e in enumerate(entries):
+            terme = (f'({e["cat"]}={own["cat"]})*({e["txt"]}={own["txt"]})*'
+                      f'({e["deb"]}={own["deb"]})*({e["fin"]}={own["fin"]})')
+            all_ifs.append(f'IF({terme},{e["nom"]},"")')
+            if j < k:
+                earlier_terms.append(terme)
+        premiere_occurrence = '1' if not earlier_terms else f'(({"+".join(earlier_terms)})=0)'
+        noms_regroupes = '_xlfn.TEXTJOIN(", ",TRUE,' + ','.join(all_ifs) + ')'
+        formule_label = (
+            f'=IF({own["txt"]}="","",'
+            f'IF({premiere_occurrence},{own["txt"]}&" ("&{noms_regroupes}&")",""))'
+        )
+        ws.cell(row=own['rr'], column=own['lbl_col'], value=formule_label)
+
     def group_new_part(cat_code, block_start_row, block_end_row, name_included):
         parts = []
         for nom_col, note_col, group in groups:
@@ -519,6 +580,30 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
         a, b = parts
         return f'IF(({a})="",({b}),IF(({b})="",({a}),({a})&"; "&({b})))'
 
+    def group_new_part_groupe(cat_code, block_start_row, block_end_row):
+        """Comme group_new_part(name_included=True), mais lit la colonne
+        cachée 'libellé fusionné' (étape 2bis) au lieu de reconstruire
+        {txt} ({nom}) ligne par ligne : les doublons (même événement, même
+        horaire, plusieurs agents) sont déjà fusionnés en amont, donc chaque
+        événement n'apparaît plus qu'une fois dans H/I/J, avec tous les
+        prénoms concernés entre parenthèses."""
+        parts = []
+        for nom_col, note_col, group in groups:
+            hstart = NOTES_HELPER_START[note_col]
+            cat_col, txt_col, deb_col, fin_col, lbl_col = (
+                hstart, hstart + 1, hstart + 2, hstart + 3, hstart + 4)
+            r1, r2 = header_row + 1, header_row + len(group)
+            cat_r = _notes_rng(cat_col, r1, r2)
+            deb_r = _notes_rng(deb_col, r1, r2)
+            fin_r = _notes_rng(fin_col, r1, r2)
+            lbl_r = _notes_rng(lbl_col, r1, r2)
+            row_start = f'(TIMEVALUE(LEFT(A{block_start_row},5))*24)'
+            row_end = f'(TIMEVALUE(MID(A{block_end_row},7,5))*24)'
+            cond = f'(({cat_r}={cat_code})*({fin_r}>{row_start})*({deb_r}<{row_end}))'
+            parts.append(f'_xlfn.TEXTJOIN("; ",TRUE,IF({cond},{lbl_r},""))')
+        a, b = parts
+        return f'IF(({a})="",({b}),IF(({b})="",({a}),({a})&"; "&({b})))'
+
     # ---- 3) fusions réellement posées sur H/I/J pour CETTE journée
     merges_by_col = {NOTES_H_COL: [], NOTES_I_COL: [], NOTES_J_COL: []}
     for mc in list(ws.merged_cells.ranges):
@@ -531,7 +616,7 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
         for (bs, be) in _notes_blocks_for(merges_by_col, vcol, first_cren, last_cren):
             anchor = ws.cell(row=bs, column=vcol)
             baked_literal = f'"{_notes_esc(anchor.value)}"' if anchor.value else '""'
-            npf = group_new_part(cat_code, bs, be, name_included=True)
+            npf = group_new_part_groupe(cat_code, bs, be)
             formula = (
                 f'=TRIM({baked_literal}&IF(({npf})="","",'
                 f'IF({baked_literal}="","","; ")&({npf})))'
@@ -1513,7 +1598,13 @@ def generer_vue_agent(wb, week_num, jours, row_lookup, agents_recap,
         for cs, ce in fine:
             cren_str = f'{cs//60:02d}:{cs%60:02d}-{ce//60:02d}:{ce%60:02d}'
             acell = ws.cell(row=r, column=1, value=cren_str)
-            acell.font = Font(size=9)
+            # CORRECTIF 09/2026 : la police du créneau (1re colonne) suivait
+            # une couleur par défaut (noire) au lieu de s'adapter au fond de
+            # l'agent — illisible sur les fonds foncés (ex. Tiphaine, violet
+            # 7030A0). On réutilise texte_agent, déjà calculé pour lisibilité
+            # (cf. _texte_lisible) et déjà utilisé sur les autres cellules de
+            # cette même vue par agent.
+            acell.font = Font(size=9, color='FF' + texte_agent)
             acell.fill = PatternFill('solid', fgColor=fond_agent)
             acell.border = GREY_BORDER
             for ci, jour in enumerate(jours_semaine, start=2):
