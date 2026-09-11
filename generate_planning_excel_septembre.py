@@ -433,7 +433,32 @@ def _notes_blocks_for(merges_by_col, col, first_cren, last_cren):
     return blocks
 
 
-def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
+BAKED_LITERAL_RE = re.compile(r'^=TRIM\("((?:""|[^"])*)"&IF\(', re.DOTALL)
+
+
+def _extraire_litteral_reel(valeur_cellule):
+    """Retrouve le texte 'réel' (événement du bloc 1, indépendant des notes
+    W-Z) à partir de la valeur ACTUELLE d'une cellule H/I/J/T/U : soit un
+    texte simple (jamais encore passé par la cascade de notes), soit une
+    ArrayFormula déjà posée par un appel précédent de cette même fonction —
+    on retrouve alors le texte figé au tout début du TRIM("...")&IF(...).
+    Renvoie (texte, ok) ; ok=False si la formule a une forme inattendue
+    (par prudence, on ne touchera alors pas à la cellule)."""
+    texte_formule = None
+    if isinstance(valeur_cellule, ArrayFormula):
+        texte_formule = valeur_cellule.text
+    elif isinstance(valeur_cellule, str) and valeur_cellule.startswith('='):
+        texte_formule = valeur_cellule
+    if texte_formule is None:
+        return valeur_cellule, True
+    m = BAKED_LITERAL_RE.match(texte_formule)
+    if not m:
+        return None, False
+    return m.group(1).replace('""', '"'), True
+
+
+def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14,
+                             preserve_baked=False, groupe1=None, groupe2=None):
     """Ajoute, pour UNE journée, le petit tableau Nom/Événement (2 groupes de
     colonnes W/X et Y/Z), ses colonnes cachées d'analyse, et fait remonter
     automatiquement les notes vers H/I/J — ainsi que vers les colonnes
@@ -441,9 +466,29 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
     catégories (Réunion, Absence, Accueil/Animation) remontent dans la vue
     par agent via la formule live de generer_vue_agent (note_cond) ; le
     mot-clé "formation" est reconnu comme Absence (catégorie 2), au même
-    titre que "congé"/"absen"/"part"."""
-    mid = (len(agents_14) + 1) // 2
-    group1, group2 = agents_14[:mid], agents_14[mid:]
+    titre que "congé"/"absen"/"part".
+
+    `preserve_baked` (utilisé uniquement lors d'un RE-passage sur un fichier
+    déjà généré, ex. mise à jour des règles de mise en forme sans tout
+    régénérer) : si un bloc H/I/J/T/U a été volontairement figé en texte
+    simple (ni formule, ni ArrayFormula — ex. après un passage par l'outil
+    de régénération), on ne le reconvertit PAS en formule ; on le laisse
+    exactement tel quel. En génération initiale (valeur par défaut), tous
+    les blocs partent de texte simple et sont normalement convertis.
+
+    `groupe1`/`groupe2` (optionnels) : répartition W/Y DÉJÀ existante à
+    respecter telle quelle (ex. lors d'un RE-passage sur un fichier déjà
+    généré, où la répartition peut avoir été modifiée à la main — un
+    vacataire ajouté directement dans le fichier — et ne plus correspondre
+    à un simple partage en 2 moitiés égales ; recalculer la coupure à
+    partir d'agents_14 décalerait alors tous les noms d'une ligne). Si
+    absents, on retombe sur le partage en 2 moitiés (comportement
+    historique, utilisé en génération initiale)."""
+    if groupe1 is not None and groupe2 is not None:
+        group1, group2 = groupe1, groupe2
+    else:
+        mid = (len(agents_14) + 1) // 2
+        group1, group2 = agents_14[:mid], agents_14[mid:]
     thin = Side(style='thin', color='FFBFBFBF')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
@@ -615,7 +660,14 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
         cat_code = NOTES_CAT_BY_COL[vcol]
         for (bs, be) in _notes_blocks_for(merges_by_col, vcol, first_cren, last_cren):
             anchor = ws.cell(row=bs, column=vcol)
-            baked_literal = f'"{_notes_esc(anchor.value)}"' if anchor.value else '""'
+            deja_formule = isinstance(anchor.value, ArrayFormula) or (
+                isinstance(anchor.value, str) and anchor.value.startswith('='))
+            if preserve_baked and not deja_formule:
+                continue  # texte figé volontairement : on n'y touche pas
+            litteral, ok = _extraire_litteral_reel(anchor.value)
+            if not ok:
+                continue  # forme de formule imprévue : par prudence, inchangé
+            baked_literal = f'"{_notes_esc(litteral)}"' if litteral else '""'
             npf = group_new_part_groupe(cat_code, bs, be)
             formula = (
                 f'=TRIM({baked_literal}&IF(({npf})="","",'
@@ -626,7 +678,14 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
     # ---- 5) T (Accueil/Animation sans prénom) aux ancres de H
     for (bs, be) in _notes_blocks_for(merges_by_col, NOTES_H_COL, first_cren, last_cren):
         t_cell = ws.cell(row=bs, column=NOTES_T_COL)
-        baked_literal = f'"{_notes_esc(t_cell.value)}"' if t_cell.value else '""'
+        deja_formule = isinstance(t_cell.value, ArrayFormula) or (
+            isinstance(t_cell.value, str) and t_cell.value.startswith('='))
+        if preserve_baked and not deja_formule:
+            continue
+        litteral, ok = _extraire_litteral_reel(t_cell.value)
+        if not ok:
+            continue
+        baked_literal = f'"{_notes_esc(litteral)}"' if litteral else '""'
         npf = group_new_part(3, bs, be, name_included=False)
         formula = (
             f'=TRIM({baked_literal}&IF(({npf})="","",'
@@ -637,7 +696,14 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
     # ---- 6) U (Réunion sans prénom) aux ancres de I
     for (bs, be) in _notes_blocks_for(merges_by_col, NOTES_I_COL, first_cren, last_cren):
         u_cell = ws.cell(row=bs, column=NOTES_U_COL)
-        baked_literal = f'"{_notes_esc(u_cell.value)}"' if u_cell.value else '""'
+        deja_formule = isinstance(u_cell.value, ArrayFormula) or (
+            isinstance(u_cell.value, str) and u_cell.value.startswith('='))
+        if preserve_baked and not deja_formule:
+            continue
+        litteral, ok = _extraire_litteral_reel(u_cell.value)
+        if not ok:
+            continue
+        baked_literal = f'"{_notes_esc(litteral)}"' if litteral else '""'
         npf = group_new_part(1, bs, be, name_included=False)
         formula = (
             f'=TRIM({baked_literal}&IF(({npf})="","",'
@@ -650,13 +716,18 @@ def ajouter_zone_notes_jour(ws, header_row, first_cren, last_cren, agents_14):
     #      fusionner_cellules_identiques : les lignes vides consécutives, non
     #      fusionnées visuellement, étaient quand même regroupées comme si
     #      elles l'étaient, cf. contexte projet).
-    h_blocks = _notes_blocks_for(merges_by_col, NOTES_H_COL, first_cren, last_cren)
-    i_blocks = _notes_blocks_for(merges_by_col, NOTES_I_COL, first_cren, last_cren)
-    for rr in range(first_cren, last_cren + 1):
-        h_anchor = next(bs for (bs, be) in h_blocks if bs <= rr <= be)
-        i_anchor = next(bs for (bs, be) in i_blocks if bs <= rr <= be)
-        ws.cell(row=rr, column=NOTES_R_COL, value=f'=H{h_anchor}')
-        ws.cell(row=rr, column=NOTES_S_COL, value=f'=I{i_anchor}')
+    # En RE-passage (preserve_baked=True), on ne retouche pas R/S : ce sont
+    # des colonnes internes (vue par agent) sans effet sur ce que Elo voit
+    # dans la grille principale, donc pas nécessaire de les reconstruire, et
+    # ça évite de changer un comportement existant qui n'a pas été demandé.
+    if not preserve_baked:
+        h_blocks = _notes_blocks_for(merges_by_col, NOTES_H_COL, first_cren, last_cren)
+        i_blocks = _notes_blocks_for(merges_by_col, NOTES_I_COL, first_cren, last_cren)
+        for rr in range(first_cren, last_cren + 1):
+            h_anchor = next(bs for (bs, be) in h_blocks if bs <= rr <= be)
+            i_anchor = next(bs for (bs, be) in i_blocks if bs <= rr <= be)
+            ws.cell(row=rr, column=NOTES_R_COL, value=f'=H{h_anchor}')
+            ws.cell(row=rr, column=NOTES_S_COL, value=f'=I{i_anchor}')
 
 
 ONGLETS_PREP_A_EMBARQUER = [
