@@ -942,8 +942,22 @@ def generer(input_path=None, output_path=None):
                         alert_msgs[h] = msg
 
                 # Événements chevauchant ce créneau
-                accueil_animation = reunion = None
-                accueil_animation_sn = reunion_sn = None  # versions SANS prénoms (vue par agent)
+                # CORRECTIF 09/2026 (bug signalé par Elo) : deux problèmes
+                # corrigés ensemble ici.
+                # 1/ Avant, un seul événement par catégorie (Accueil/Animation
+                #    ou Réunion) pouvait être retenu par créneau : si deux
+                #    événements de la même catégorie se chevauchaient (ex.
+                #    une Formation et un autre événement en même temps),
+                #    le second écrasait silencieusement le premier. On
+                #    accumule maintenant TOUS les événements qui chevauchent
+                #    dans des listes, jointes ensuite par "; ".
+                # 2/ Ces événements étaient de toute façon jetés plus bas
+                #    quand le créneau est fermé au public (`not ouvert`) —
+                #    seules les absences survivaient. Ce n'est plus le cas :
+                #    voir plus bas, `accueil_animation`/`reunion` sont
+                #    désormais affichés que le créneau soit ouvert ou fermé.
+                accueil_animation_list, reunion_list = [], []
+                accueil_animation_sn_list, reunion_sn_list = [], []  # versions SANS prénoms (vue par agent)
                 absence = []
                 # Surlignage jaune (09/2026, demande utilisatrice) : un
                 # événement Accueil/Animation ou Réunion sans agent ni
@@ -951,7 +965,7 @@ def generer(input_path=None, output_path=None):
                 # du planning final, pas seulement dans l'onglet Événements
                 # source (bloc 1) — plus facile à repérer d'un coup d'œil.
                 accueil_incomplet = reunion_incomplet = False
-                accueil_incomplet_msg = reunion_incomplet_msg = None
+                accueil_incomplet_msg_list, reunion_incomplet_msg_list = [], []
                 for ev in evenements:
                     if ev['date'] != date_str:
                         continue
@@ -974,22 +988,47 @@ def generer(input_path=None, output_path=None):
                             raisons.append('horaire non renseigné')
                         msg_incomplet = f"« {nom} » : {', '.join(raisons)}"
                     if cat == 'Réunion':
-                        reunion, reunion_sn = label, label_sn
-                        reunion_incomplet = incomplet
+                        reunion_list.append(label)
+                        reunion_sn_list.append(label_sn)
                         if incomplet:
-                            reunion_incomplet_msg = msg_incomplet
+                            reunion_incomplet = True
+                            reunion_incomplet_msg_list.append(msg_incomplet)
                     else:
-                        accueil_animation, accueil_animation_sn = label, label_sn
-                        accueil_incomplet = incomplet
+                        accueil_animation_list.append(label)
+                        accueil_animation_sn_list.append(label_sn)
                         if incomplet:
-                            accueil_incomplet_msg = msg_incomplet
+                            accueil_incomplet = True
+                            accueil_incomplet_msg_list.append(msg_incomplet)
+                accueil_animation = '; '.join(accueil_animation_list) if accueil_animation_list else None
+                reunion = '; '.join(reunion_list) if reunion_list else None
+                accueil_animation_sn = '; '.join(accueil_animation_sn_list) if accueil_animation_sn_list else None
+                reunion_sn = '; '.join(reunion_sn_list) if reunion_sn_list else None
+                accueil_incomplet_msg = '; '.join(accueil_incomplet_msg_list) if accueil_incomplet_msg_list else None
+                reunion_incomplet_msg = '; '.join(reunion_incomplet_msg_list) if reunion_incomplet_msg_list else None
                 absence_txt = f"congé ({', '.join(sorted(set(absence)))})" if absence else None
 
                 if not ouvert:
                     rdc_l = adulte_l = mf_l = jeun1_l = jeun2_l = jeun3_l = []
-                    values = [cren_str, '—', '—', '—', '—', '—', '—', None, None, absence_txt]
+                    # CORRECTIF 09/2026 : un créneau fermé au public n'a plus
+                    # le droit d'écraser un événement (Accueil/Animation,
+                    # Réunion) qui a réellement lieu à ce moment-là — seules
+                    # les colonnes de service (RDC/Adulte/M&F/Jeunesse)
+                    # restent à '—', car la médiathèque n'y assure aucune
+                    # présence public sur ce créneau.
+                    values = [cren_str, '—', '—', '—', '—', '—', '—',
+                              accueil_animation, reunion, absence_txt]
+                    alerte_jaune_headers = set()
+                    alerte_jaune_msgs = {}
+                    if accueil_incomplet:
+                        alerte_jaune_headers.add('Accueil / Animation')
+                        alerte_jaune_msgs['Accueil / Animation'] = accueil_incomplet_msg
+                    if reunion_incomplet:
+                        alerte_jaune_headers.add('Réunion')
+                        alerte_jaune_msgs['Réunion'] = reunion_incomplet_msg
                     write_row(ws, r, values, DATA_FILLS_CLOSED,
-                              discret=(jour in JOURS_DISCRETS))
+                              discret=(jour in JOURS_DISCRETS),
+                              alerte_jaune_headers=alerte_jaune_headers,
+                              alerte_jaune_msgs=alerte_jaune_msgs)
                     rdc = adulte = mf = jeun1 = jeun2 = jeun3 = '—'
                 else:
                     rdc_l = sol_c.get('RDC', [])
@@ -1026,8 +1065,13 @@ def generer(input_path=None, output_path=None):
                 valeurs_brutes[(r, 5)] = jeun1
                 valeurs_brutes[(r, 6)] = jeun2
                 valeurs_brutes[(r, 7)] = jeun3
-                valeurs_brutes[(r, 8)] = accueil_animation if ouvert else None
-                valeurs_brutes[(r, 9)] = reunion if ouvert else None
+                # CORRECTIF 09/2026 : plus de restriction "if ouvert" — un
+                # événement affiché sur un créneau fermé (voir plus haut)
+                # doit aussi pouvoir se fusionner verticalement avec le
+                # même événement sur le créneau suivant, comme pour un
+                # créneau ouvert.
+                valeurs_brutes[(r, 8)] = accueil_animation
+                valeurs_brutes[(r, 9)] = reunion
                 valeurs_brutes[(r, 10)] = absence_txt
                 # Colonne cachée : durée du créneau en heures, calculée depuis le
                 # texte "HH:MM-HH:MM" de la colonne A. IFERROR->0 pour les lignes
@@ -1053,8 +1097,10 @@ def generer(input_path=None, output_path=None):
                 # utilisatrice), utilisées uniquement par la vue par agent —
                 # valeur écrite directement (pas une formule miroir de H/I,
                 # puisque le texte diffère : jamais de prénom ici).
-                ws[f'T{r}'] = accueil_animation_sn if ouvert else None
-                ws[f'U{r}'] = reunion_sn if ouvert else None
+                # CORRECTIF 09/2026 : idem, la vue par agent doit elle aussi
+                # afficher l'événement sur un créneau fermé.
+                ws[f'T{r}'] = accueil_animation_sn
+                ws[f'U{r}'] = reunion_sn
                 ws.row_dimensions[r].height = 20
                 lignes_jour.append(r)
                 row_lookup[(jour, cs, ce)] = r
