@@ -3,16 +3,14 @@
 app.py — Assistant Planning Médiathèque
 =========================================
 
-Application en une seule page (défilement vertical), organisée en 4 blocs :
+Application en une seule page (défilement vertical), organisée en 3 blocs :
 
   1. Créer l'onglet Événements à partir des fichiers sources bruts
   2. Générer le planning mensuel (à partir du fichier Événements + du
      fichier de Préparation mensuelle)
   3. Vérifier un planning déjà rempli / modifié à la main
-  4. Régénérer un ou plusieurs jours d'un planning déjà généré, sans
-     toucher au reste du fichier
 
-Les 4 blocs sont fonctionnels.
+Les 3 blocs sont fonctionnels.
 """
 
 import io
@@ -123,7 +121,8 @@ st.header("1. Créer l'onglet Événements")
 st.markdown(
     "**Ce que fait ce bloc :** tu déposes ici les fichiers bruts que tu tiens "
     "déjà au fil du mois (congés, accueil libre crèche, accueil de classe, "
-    "Lectures AssMat/AssPar, fichier Excel Evenement). L'app les lit tous et "
+    "Lectures AssMat/AssPar, accueil CML mercredis/vacances, fichier Excel "
+    "Evenement). L'app les lit tous et "
     "construit automatiquement un fichier Excel avec l'onglet **Événements** "
     "prêt à l'emploi, en surlignant en jaune les cas où il manque une "
     "information (heure ou nom d'agent) pour que tu puisses les compléter "
@@ -179,6 +178,32 @@ with st.form("form_evenements"):
         "Fichier(s) Lectures AssMat/AssPar", type=["xlsx"], accept_multiple_files=True, key="f_lecture"
     )
 
+    st.markdown("**Accueil CML (centres de loisirs) — mercredis**")
+    st.caption(
+        "Le fichier Word listant, pour chaque mercredi, le centre de loisirs "
+        "inscrit (13h30-14h30, en section jeunesse). Les mercredis sans "
+        "centre encore inscrit ne créent pas d'événement. Aucun agent n'est "
+        "à affecter — c'est normal, pas d'alerte pour ça."
+    )
+    f_cml_mercredis = st.file_uploader(
+        "Fichier(s) Accueil CML — mercredis", type=["docx"],
+        accept_multiple_files=True, key="f_cml_mercredis",
+    )
+
+    st.markdown("**Accueil CML (centres de loisirs) — vacances**")
+    st.caption(
+        "Le fichier Word listant les accueils de centres de loisirs pendant "
+        "les vacances scolaires, avec les dates, horaires et centres pour "
+        "chaque période. Si une date est déjà réservée mais que le centre "
+        "ou l'horaire ne sont pas encore connus, l'événement est quand même "
+        "créé et surligné en jaune pour que tu penses à le compléter. "
+        "Aucun agent n'est à affecter — c'est normal, pas d'alerte pour ça."
+    )
+    f_cml_vacances = st.file_uploader(
+        "Fichier(s) Accueil CML — vacances", type=["docx"],
+        accept_multiple_files=True, key="f_cml_vacances",
+    )
+
     st.markdown("**Fichier Excel Evenement**")
     st.caption(
         "Réinjecte le fichier Excel \"calendrier des événements\" et indique "
@@ -212,7 +237,7 @@ with st.form("form_evenements"):
     submitted = st.form_submit_button("Générer l'onglet Événements", type="primary")
 
 if submitted:
-    if not any([f_conges, f_creche, f_classe, f_lecture, f_calendrier]):
+    if not any([f_conges, f_creche, f_classe, f_lecture, f_cml_mercredis, f_cml_vacances, f_calendrier]):
         st.warning("Dépose au moins un fichier source avant de générer.")
     else:
         with st.spinner("Lecture des fichiers et construction de l'onglet Événements…"):
@@ -234,6 +259,14 @@ if submitted:
                 p_lecture = _save_uploaded_list(f_lecture, tmp_dir)
                 if p_lecture:
                     sources["lecture_jeudi"] = p_lecture
+
+                p_cml_mercredis = _save_uploaded_list(f_cml_mercredis, tmp_dir)
+                if p_cml_mercredis:
+                    sources["accueil_cml_mercredis"] = p_cml_mercredis
+
+                p_cml_vacances = _save_uploaded_list(f_cml_vacances, tmp_dir)
+                if p_cml_vacances:
+                    sources["accueil_cml_vacances"] = p_cml_vacances
 
                 p_calendrier = _save_uploaded(f_calendrier, tmp_dir)
                 if p_calendrier and nom_onglet_calendrier.strip():
@@ -465,13 +498,7 @@ st.markdown(
     "ce fichier sont utilisés tels quels pour le recalcul. Si tu as besoin "
     "de les modifier avant de relancer, il faut d'abord les déverrouiller "
     "dans Excel (clic droit sur l'onglet → Ôter la protection de la "
-    "feuille, aucun mot de passe requis).\n\n"
-    "✏️ Les onglets 'Paramètres' et 'Affectations', eux, sont directement "
-    "modifiables (pas besoin de les déverrouiller) — utile par exemple pour "
-    "ajouter une nouvelle section à un agent nouvellement formé en cours de "
-    "mois. Modifie-les dans Excel, enregistre, puis dépose ce fichier "
-    "ci-dessous et choisis les jours à régénérer à partir de la date du "
-    "changement."
+    "feuille, aucun mot de passe requis)."
 )
 
 f_planning_regen = st.file_uploader(
@@ -582,6 +609,15 @@ if f_planning_regen:
                                 f"Détail technique : {e}"
                             )
                             st.stop()
+
+                    if lecture["jours_fixes"]:
+                        st.info(
+                            "ℹ️ Comme seule une partie de la semaine a été régénérée, "
+                            "l'onglet 'vue par agent' de cette semaine n'a pas été "
+                            "reconstruit automatiquement (limite connue) — il garde "
+                            "l'affichage d'avant sur les jours non régénérés. À vérifier "
+                            "à la main si besoin."
+                        )
 
                     if not jours_infaisables_calcul:
                         st.success("✅ Nouveau fichier prêt.")
