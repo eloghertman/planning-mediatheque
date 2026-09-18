@@ -30,12 +30,13 @@ from planning_engine_cpsat import (
 ONGLETS_PREP_PREFIXE = '_prep_'
 # Onglets recopiés en VISIBLE (sans préfixe '_prep_') plutôt qu'en très masqué :
 # 'Planning_type' et "horaires d'équipes" (consultables, verrouillés) depuis
-# 09/2026 ; 'Paramètres' et 'Affectations' (modifiables) depuis 08/2026, pour
-# permettre les mises à jour en cours de mois (ex. nouvelle habilitation
-# d'un agent) suivies d'une régénération partielle (bloc 4). Repli automatique
-# sur la version masquée '_prep_...' pour les fichiers générés par une version
-# antérieure de l'outil (voir boucle ci-dessous).
-ONGLETS_PREP_SANS_PREFIXE = {'Planning_type', 'Paramètres', 'Affectations'}
+# 09/2026 ; 'Paramètres' et 'Affectations' (modifiables) depuis 08/2026, et
+# 'Roulement_Samedi' (modifiable) depuis 09/2026, pour permettre les mises à
+# jour en cours de mois (ex. nouvelle habilitation d'un agent, changement de
+# roulement BLEU/ROUGE) suivies d'une régénération partielle (bloc 4). Repli
+# automatique sur la version masquée '_prep_...' pour les fichiers générés
+# par une version antérieure de l'outil (voir boucle ci-dessous).
+ONGLETS_PREP_SANS_PREFIXE = {'Planning_type', 'Paramètres', 'Affectations', 'Roulement_Samedi'}
 ONGLETS_PREP_NOMS = [
     'Paramètres', 'Horaires_Des_Agents', 'Affectations', 'Roulement_Samedi',
     # Ajoutés (09/2026) : nécessaires à la vérification de la couverture

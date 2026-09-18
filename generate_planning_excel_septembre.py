@@ -1207,6 +1207,7 @@ def generer(input_path=None, output_path=None):
     embarquer_horaires_agents_visible(wb, raw)
     embarquer_parametres_visible(wb, raw)
     embarquer_affectations_visible(wb, raw)
+    embarquer_roulement_samedi_visible(wb, raw)
     wb.save(output_path)
     print('Fichier genere:', output_path)
     return output_path, weeks_data, metadata
@@ -1226,19 +1227,19 @@ def generer(input_path=None, output_path=None):
 # colonnes Accueil/Animation/Réunion/Absence (H/I/J) et les notes agents
 # (colonnes W-Z) du planning lui-même.
 ONGLETS_PREPARATION_A_RECOPIER = [
-    'Roulement_Samedi',
     # Ajoutés (09/2026, demande utilisatrice) : nécessaires à planning_checker.py
     # pour vérifier la contrainte dure "nombre d'agents Jeunesse = planning type
     # (hors vacances) / Besoins_Jeunesse (vacances scolaires)", ainsi que la
     # couverture RDC/Adulte/M&F par rapport au planning type.
     # NB : ni 'Planning_type', ni "horaires d'équipes", ni 'Paramètres', ni
-    # 'Affectations' ne sont dans cette liste — ils sont recopiés à part, en
-    # onglet VISIBLE (cf. embarquer_planning_type_visible /
+    # 'Affectations', ni 'Roulement_Samedi' ne sont dans cette liste — ils
+    # sont recopiés à part, en onglet VISIBLE (cf. embarquer_planning_type_visible /
     # embarquer_horaires_agents_visible / embarquer_parametres_visible /
-    # embarquer_affectations_visible), pas en très masqué, car les agents
-    # doivent pouvoir les consulter (Planning_type, horaires d'équipes) ou
-    # même les modifier en cours de mois (Paramètres, Affectations —
-    # demande utilisatrice 08/2026, cf. régénération partielle).
+    # embarquer_affectations_visible / embarquer_roulement_samedi_visible),
+    # pas en très masqué, car les agents doivent pouvoir les consulter
+    # (Planning_type, horaires d'équipes) ou même les modifier en cours de
+    # mois (Paramètres, Affectations, Roulement_Samedi — demande
+    # utilisatrice 08/2026 et 09/2026, cf. régénération partielle).
     'Besoins_Jeunesse', 'Jours_speciaux',
 ]
 
@@ -1465,6 +1466,17 @@ def embarquer_parametres_visible(wb, raw):
     structure protégée, contenu librement modifiable (mois/année, créneaux,
     couleurs samedi, présences vacataires...)."""
     _embarquer_prep_visible_modifiable(wb, raw, 'Paramètres')
+
+
+def embarquer_roulement_samedi_visible(wb, raw):
+    """Roulement_Samedi : voir _embarquer_prep_visible_modifiable — onglet
+    visible, structure protégée, contenu librement modifiable (demande
+    utilisatrice 09/2026 : le roulement BLEU/ROUGE et ses exceptions par
+    agent peuvent changer en cours de mois ; il faut pouvoir les corriger
+    directement dans le planning généré, puis relancer une régénération
+    partielle (bloc 4) qui relira ces valeurs telles quelles — même logique
+    que pour Paramètres/Affectations)."""
+    _embarquer_prep_visible_modifiable(wb, raw, 'Roulement_Samedi')
 
 
 def embarquer_affectations_visible(wb, raw):
