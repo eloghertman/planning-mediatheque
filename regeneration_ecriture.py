@@ -38,6 +38,7 @@ from generate_planning_excel_septembre import (
     agent_cell_style, fmt_agents, GREY_BORDER, generer_vue_agent, is_vacataire,
 )
 from planning_checker import JOURS_ORDRE, _trouver_onglet_insensible_casse
+from regeneration_sources import appliquer_corrections_affichage
 
 BORDURE_ALERTE = Border(*[Side(style='thick', color='FFE74C3C')] * 4)
 
@@ -124,9 +125,17 @@ def _poser_alerte(ws, jour_data, ev, texte_commentaire):
     return True
 
 
-def ecrire_regeneration(file_bytes, lecture_resultat, calcul_resultat):
+def ecrire_regeneration(file_bytes, lecture_resultat, calcul_resultat, evenements_sources=None):
     """Retourne les bytes du nouveau fichier Excel (le fichier original
-    n'est jamais modifié en place)."""
+    n'est jamais modifié en place).
+
+    `evenements_sources` (optionnel, 09/2026, demande utilisatrice) :
+    événements lus dans des fichiers sources mis à jour déposés à cette même
+    étape (cf. regeneration_sources.py). Pour chacun, si un événement déjà
+    affiché dans le planning correspond mais est encore incomplet (jaune,
+    sans agent), la case Accueil/Animation, Réunion ou Absence concernée est
+    corrigée directement (jaune retiré, prénom ajouté), et une éventuelle
+    note manuelle devenue redondante est supprimée."""
     wb = openpyxl.load_workbook(BytesIO(file_bytes))  # data_only=False : on garde les formules
     semaine_num = lecture_resultat['semaine_num']
     nom_onglet = _trouver_onglet_insensible_casse(wb, f'Semaine_{semaine_num}')
@@ -134,6 +143,7 @@ def ecrire_regeneration(file_bytes, lecture_resultat, calcul_resultat):
     jours_dispo = lecture_resultat['jours_data_bruts']
 
     jours_infaisables = []
+    messages_corrections = []
 
     # ── 1. Réécriture des colonnes B à G des jours régénérés ────────────
     for jour_res in calcul_resultat['jours']:
@@ -171,6 +181,18 @@ def ecrire_regeneration(file_bytes, lecture_resultat, calcul_resultat):
             # Colonnes cachées L-Q : formules '=B{r}' etc déjà en place,
             # elles se recalculeront automatiquement à l'ouverture du
             # fichier dans Excel — rien à faire ici.
+
+    # ── 1bis. Correction des événements incomplets, si des fichiers
+    #      sources mis à jour ont été déposés (09/2026, demande utilisatrice) ──
+    if evenements_sources:
+        for jour_res in calcul_resultat['jours']:
+            jour_maj = jour_res['jour']
+            jour_data = jours_dispo[jour_maj]
+            date_str = jour_data.get('date_str')
+            evs_ce_jour = [ev for ev in evenements_sources
+                          if ev['date'].isoformat() == date_str]
+            if evs_ce_jour:
+                messages_corrections += appliquer_corrections_affichage(ws, jour_data, evs_ce_jour)
 
     # ── 2. Reconstruction de l'onglet "vue par agent" ("Semaine_N_Agent") ──
     # Cet onglet est reconstruit à CHAQUE régénération, même partielle
@@ -237,4 +259,4 @@ def ecrire_regeneration(file_bytes, lecture_resultat, calcul_resultat):
 
     buf = BytesIO()
     wb.save(buf)
-    return buf.getvalue(), jours_infaisables, agent_sheet_reconstruit
+    return buf.getvalue(), jours_infaisables, agent_sheet_reconstruit, messages_corrections

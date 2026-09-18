@@ -16,6 +16,7 @@ Les 3 blocs sont fonctionnels.
 import io
 import os
 import tempfile
+from datetime import date
 
 import streamlit as st
 
@@ -27,6 +28,10 @@ from regeneration_lecture import (
 )
 from regeneration_calcul import regenerer_jours, resumer_calcul
 from regeneration_ecriture import ecrire_regeneration
+from regeneration_sources import (
+    detecter_type_source, parser_fichiers_sources, construire_contraintes_calcul,
+    TYPES_SOURCE_LABELS,
+)
 
 st.set_page_config(page_title="Planning Médiathèque", page_icon="📅", layout="centered")
 
@@ -500,7 +505,6 @@ st.markdown(
     "dans Excel (clic droit sur l'onglet → Ôter la protection de la "
     "feuille, aucun mot de passe requis)."
 )
-
 f_planning_regen = st.file_uploader(
     "Fichier planning du mois à régénérer", type=["xlsx"], key="f_regen_fichier"
 )
@@ -539,6 +543,25 @@ if f_planning_regen:
                 key="regen_jours",
             )
 
+            st.markdown("**Fichiers sources mis à jour (facultatif)**")
+            st.caption(
+                "Si un événement affiché en jaune (incomplet, sans agent) "
+                "peut maintenant être complété, dépose ici le(s) fichier(s) "
+                "source(s) à jour — congés, accueil crèche, accueil de "
+                "classe, lectures AssMat/AssPar, accueil CML mercredis ou "
+                "vacances (Word ou Excel, peu importe, l'app reconnaît "
+                "chaque fichier tout seule). Seul(s) le/les jour(s) "
+                "sélectionné(s) ci-dessus seront pris en compte. La case "
+                "concernée sera corrigée (jaune retiré, prénom ajouté) ; un "
+                "événement tout à fait nouveau sera pris en compte pour le "
+                "calcul mais pas ajouté visuellement — à saisir toi-même via "
+                "la zone de notes si besoin."
+            )
+            f_sources_regen = st.file_uploader(
+                "Fichier(s) source(s) mis à jour", type=["xlsx", "docx"],
+                accept_multiple_files=True, key="f_regen_sources",
+            )
+
             lancer_regen = st.button(
                 "Lancer la régénération", type="primary", key="btn_regen"
             )
@@ -564,6 +587,50 @@ if f_planning_regen:
 
                     st.markdown("**Ce qui a été lu dans le fichier :**")
                     st.text(resumer_lecture(lecture))
+
+                    # ── Fichiers sources mis à jour (facultatif) ────────
+                    evenements_sources = []
+                    if f_sources_regen:
+                        with st.spinner("Lecture des fichiers sources mis à jour…"):
+                            tmp_dir_sources = tempfile.mkdtemp()
+                            chemins_et_types = []
+                            for f in f_sources_regen:
+                                chemin = _save_uploaded(f, tmp_dir_sources)
+                                chemins_et_types.append((chemin, detecter_type_source(chemin)))
+
+                            jours_cibles_dates = [
+                                date.fromisoformat(lecture['jours_data_bruts'][j]['date_str'])
+                                for j in jours_choisis
+                                if lecture['jours_data_bruts'][j].get('date_str')
+                            ]
+                            evenements_sources, stats_sources = parser_fichiers_sources(
+                                chemins_et_types, jours_cibles_dates
+                            )
+
+                        st.markdown("**Fichiers sources mis à jour — ce qui a été compris :**")
+                        for s in stats_sources:
+                            nom_fichier = os.path.basename(s['chemin'])
+                            if s['erreur']:
+                                st.error(f"« {nom_fichier} » : {s['erreur']}")
+                            elif s['type'] not in TYPES_SOURCE_LABELS:
+                                st.warning(
+                                    f"« {nom_fichier} » : type de fichier non reconnu — ignoré. "
+                                    "Préviens-moi de son contenu et j'ajouterai la lecture "
+                                    "correspondante si besoin."
+                                )
+                            else:
+                                label = TYPES_SOURCE_LABELS[s['type']]
+                                st.write(
+                                    f"« {nom_fichier} » → reconnu comme **{label}** "
+                                    f"({s['trouves']} événement(s) pour le(s) jour(s) régénéré(s))."
+                                )
+
+                        if evenements_sources:
+                            contraintes_sources = construire_contraintes_calcul(
+                                evenements_sources, lecture['jours_data_bruts']
+                            )
+                            lecture['evenements_regeneres'] += contraintes_sources
+                            lecture['evenements_tous_jours'] += contraintes_sources
 
                     if lecture["conflits"]:
                         st.warning(
@@ -600,8 +667,11 @@ if f_planning_regen:
 
                     with st.spinner("Écriture du nouveau fichier…"):
                         try:
-                            new_bytes, jours_infaisables_ecriture, agent_sheet_ok = (
-                                ecrire_regeneration(file_bytes_regen, lecture, calcul)
+                            new_bytes, jours_infaisables_ecriture, agent_sheet_ok, messages_corrections = (
+                                ecrire_regeneration(
+                                    file_bytes_regen, lecture, calcul,
+                                    evenements_sources=evenements_sources,
+                                )
                             )
                         except Exception as e:
                             st.error(
@@ -609,6 +679,11 @@ if f_planning_regen:
                                 f"Détail technique : {e}"
                             )
                             st.stop()
+
+                    if messages_corrections:
+                        st.markdown("**Événements incomplets corrigés :**")
+                        for m in messages_corrections:
+                            st.write(f"✅ {m}")
 
                     if lecture["jours_fixes"]:
                         st.info(
