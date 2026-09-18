@@ -57,6 +57,10 @@ from datetime import datetime, date
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.comments import Comment
+from docx import Document as DocxDocument
+from docx.document import Document as _WordDocument
+from docx.table import Table as _WordTable
+from docx.text.paragraph import Paragraph as _WordParagraph
 
 # ══════════════════════════════════════════════════════════════
 #  RÉFÉRENTIEL COMMUN
@@ -417,7 +421,180 @@ def parse_lecture_jeudi_matin(path, mois, annee):
 
 
 # ══════════════════════════════════════════════════════════════
-#  5. CALENDRIER DES ÉVÉNEMENTS DÉJÀ SAISI (passthrough)
+#  5. ACCUEIL CML (Centres de loisirs) — outils communs
+# ══════════════════════════════════════════════════════════════
+
+def _iter_block_items(parent):
+    """Parcourt un document Word paragraphe par paragraphe ET tableau par
+    tableau, dans l'ordre où ils apparaissent réellement dans le fichier
+    (contrairement à doc.paragraphs / doc.tables, qui les séparent en deux
+    listes distinctes et font perdre l'ordre — indispensable ici pour savoir
+    quel paragraphe 'Du JJ/MM/AA au JJ/MM/AA' précède quel tableau)."""
+    parent_elm = parent.element.body if isinstance(parent, _WordDocument) else parent._element
+    for child in parent_elm.iterchildren():
+        if child.tag.endswith('}p'):
+            yield _WordParagraph(child, parent)
+        elif child.tag.endswith('}tbl'):
+            yield _WordTable(child, parent)
+
+
+def parse_heure_range_flexible(raw):
+    """Comme parse_heure_range, mais reconnaît aussi un séparateur espace
+    ('14h00 15h00') ou tiret cadratin ('14h – 15h'), pas seulement le tiret
+    simple. Renvoie (début, fin) normalisés (ex. '14h00' -> '14h'), ou
+    (None, None) si on ne trouve pas deux heures dans le texte."""
+    if not raw:
+        return None, None
+    s = str(raw).strip().lower().replace('–', ' ').replace('—', ' ').replace('-', ' ')
+    heures = re.findall(r'\d{1,2}h\d{0,2}', s)
+    if len(heures) < 2:
+        return None, None
+
+    def _norm(h):
+        m = re.match(r'(\d{1,2})h(\d{0,2})', h)
+        heure, minute = m.group(1), m.group(2)
+        return f"{heure}h{minute}" if minute and minute != '00' else f"{heure}h"
+
+    return _norm(heures[0]), _norm(heures[1])
+
+
+def parse_accueil_cml_mercredis(path, mois, annee):
+    """Fichier Word 'Accueil_mercredis_CML' : un tableau à 2 colonnes
+    (Date | CML). Date en texte 'JJ/MM' (ex: '14/10' = 14 octobre), sans
+    année — on utilise directement l'année demandée. Horaire toujours fixe
+    13h30-14h30 (il n'y a pas de colonne horaire dans ce fichier — règle
+    validée avec Elo). Chaque date du tableau est un mercredi déjà réservé
+    pour l'accueil : l'événement est donc toujours créé, même si la colonne
+    CML est encore vide — dans ce cas il est surligné en jaune comme
+    pense-bête à compléter (même règle que pour le fichier vacances).
+
+    Aucun agent de la médiathèque n'est jamais affecté à cet accueil (visite
+    libre encadrée par les animateurs du centre) : l'événement est donc
+    nommé 'Accueil libre CML...' pour ne pas déclencher l'alerte générique
+    'agent manquant' (comme pour les accueils libres crèche/école)."""
+    doc = DocxDocument(path)
+    if not doc.tables:
+        raise ValueError(f"Aucun tableau trouvé dans {path}")
+    table = doc.tables[0]
+
+    events = []
+    for row in table.rows[1:]:  # ligne 0 = en-têtes 'Date' / 'CML'
+        cells = [c.text.strip() for c in row.cells]
+        if len(cells) < 2:
+            continue
+        date_txt, cml_txt = cells[0], cells[1]
+        m = re.search(r'(\d{1,2})\s*/\s*(\d{1,2})', date_txt)
+        if not m:
+            continue
+        jour, mois_ligne = int(m.group(1)), int(m.group(2))
+        if mois_ligne != mois:
+            continue  # ligne d'un autre mois
+        try:
+            d = date(annee, mois, jour)
+        except ValueError:
+            continue
+
+        centre = cml_txt.splitlines()[0].strip() if cml_txt else ''
+        nom = f"Accueil libre CML – {centre}" if centre else "Accueil libre CML"
+        events.append(_event(
+            d, '13h30', '14h30', nom, [],
+            alert=not centre,
+            alert_reason=(
+                "Centre pas encore renseigné dans le fichier source pour ce "
+                "mercredi déjà réservé — à compléter."
+            ) if not centre else None,
+            source='accueil CML (mercredi)',
+        ))
+    return events
+
+
+# ══════════════════════════════════════════════════════════════
+#  6. ACCUEIL CML (Centres de loisirs) — vacances
+# ══════════════════════════════════════════════════════════════
+
+_RE_PERIODE_VACANCES = re.compile(
+    r'du\s+(\d{1,2})/(\d{1,2})/(\d{2,4})\s+au\s+(\d{1,2})/(\d{1,2})/(\d{2,4})',
+    re.IGNORECASE,
+)
+
+
+def _annee_4_chiffres(a):
+    a = int(a)
+    return a if a >= 100 else 2000 + a
+
+
+def parse_accueil_cml_vacances(path, mois, annee):
+    """Fichier Word 'Accueil_vacances_CML' : un tableau par période de
+    vacances (Toussaint, Noël, hiver, printemps...), précédé d'un paragraphe
+    'Du JJ/MM/AA au JJ/MM/AA' qui donne les années réelles de la période
+    (utile pour Noël, qui chevauche deux années civiles). Colonnes du
+    tableau : Centre | Date ('Mardi JJ/MM') | Horaire | Nbre encadrants |
+    Nbre enfants | N° téléphone | Accueil.
+
+    Si le centre ou l'horaire ne sont pas encore renseignés pour une date
+    déjà réservée, l'événement est quand même créé mais surligné en jaune
+    comme pense-bête à compléter (règle validée avec Elo). Aucun agent de la
+    médiathèque n'est jamais affecté (accueil pris en charge par les
+    animateurs du centre) : nom d'événement préfixé 'Accueil libre CML...'
+    pour ne pas déclencher l'alerte générique 'agent manquant'."""
+    doc = DocxDocument(path)
+
+    events = []
+    periode = None  # (mois_debut, année_debut, mois_fin, année_fin)
+    for block in _iter_block_items(doc):
+        if isinstance(block, _WordParagraph):
+            m = _RE_PERIODE_VACANCES.search(block.text)
+            if m:
+                jd, md, ad, jf, mf, af = m.groups()
+                periode = (int(md), _annee_4_chiffres(ad), int(mf), _annee_4_chiffres(af))
+            continue
+
+        # C'est un tableau
+        for row in block.rows[1:]:  # ligne 0 = en-têtes
+            cells = [c.text.strip() for c in row.cells]
+            if len(cells) < 3:
+                continue
+            centre_txt, date_txt, horaire_txt = cells[0], cells[1], cells[2]
+            m = re.search(r'(\d{1,2})\s*/\s*(\d{1,2})', date_txt.replace('\n', ' '))
+            if not m:
+                continue
+            jour, mois_ligne = int(m.group(1)), int(m.group(2))
+            if mois_ligne != mois:
+                continue
+
+            if periode is None:
+                annee_ligne = annee  # pas de période repérée avant ce tableau : repli sur l'année demandée
+            elif mois_ligne == periode[0]:
+                annee_ligne = periode[1]
+            elif mois_ligne == periode[2]:
+                annee_ligne = periode[3]
+            else:
+                annee_ligne = periode[1]
+
+            try:
+                d = date(annee_ligne, mois, jour)
+            except ValueError:
+                continue
+
+            centre = centre_txt.replace('\n', ' ').strip()
+            debut, fin = parse_heure_range_flexible(horaire_txt)
+            incomplet = (not centre) or (debut is None)
+
+            nom = f"Accueil libre CML vacances – {centre}" if centre else "Accueil libre CML vacances"
+            events.append(_event(
+                d, debut, fin, nom, [],
+                alert=incomplet,
+                alert_reason=(
+                    "Centre et/ou horaire pas encore renseignés dans le fichier "
+                    "source pour cette date déjà réservée — à compléter."
+                ) if incomplet else None,
+                source='accueil CML (vacances)',
+            ))
+    return events
+
+
+# ══════════════════════════════════════════════════════════════
+#  7. CALENDRIER DES ÉVÉNEMENTS DÉJÀ SAISI (passthrough)
 # ══════════════════════════════════════════════════════════════
 
 def parse_calendrier_evenements(path, sheet_name):
@@ -555,6 +732,8 @@ def generate_evenements(mois, annee, out_path, sources=None):
         'accueil_creche':    chemin, ou liste de chemins (plusieurs années scolaires)
         'accueil_classe':    chemin, ou liste de chemins
         'lecture_jeudi':      chemin, ou liste de chemins
+        'accueil_cml_mercredis': chemin (.docx), ou liste de chemins
+        'accueil_cml_vacances':  chemin (.docx), ou liste de chemins
         'calendrier': (chemin, nom_onglet)  -> réinjecté tel quel (passthrough)
     Renvoie (events, stats) où stats = {'total':…, 'alerts':…, 'par_source': {...}}.
     """
@@ -586,6 +765,16 @@ def generate_evenements(mois, annee, out_path, sources=None):
         evs = parse_lecture_jeudi_matin(path, mois, annee)
         all_events += evs
         par_source['lecture jeudi matin'] = par_source.get('lecture jeudi matin', 0) + len(evs)
+
+    for path in _as_list(sources.get('accueil_cml_mercredis')):
+        evs = parse_accueil_cml_mercredis(path, mois, annee)
+        all_events += evs
+        par_source['accueil CML (mercredi)'] = par_source.get('accueil CML (mercredi)', 0) + len(evs)
+
+    for path in _as_list(sources.get('accueil_cml_vacances')):
+        evs = parse_accueil_cml_vacances(path, mois, annee)
+        all_events += evs
+        par_source['accueil CML (vacances)'] = par_source.get('accueil CML (vacances)', 0) + len(evs)
 
     if sources.get('calendrier'):
         path, sheet_name = sources['calendrier']
