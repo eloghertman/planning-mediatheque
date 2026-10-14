@@ -680,11 +680,55 @@ def parse_accueil_cml_vacances(path, mois, annee):
 #  7. CALENDRIER DES ÉVÉNEMENTS DÉJÀ SAISI (passthrough)
 # ══════════════════════════════════════════════════════════════
 
-def parse_calendrier_evenements(path, sheet_name):
+_MOIS_SANS_ACCENT = {_sans_accents(v): k for k, v in MOIS_FR.items()}  # 'decembre' -> 12, 'fevrier' -> 2...
+
+
+def _date_depuis_texte(valeur, annee_defaut=None):
+    """Convertit une date saisie à la main en vraie date (datetime.date),
+    pour pouvoir la trier avec les autres. Accepte :
+      - une vraie date Excel (datetime/date) ;
+      - un texte 'mardi 1 décembre 2026', 'mardi 1 decembre' (sans accent),
+        'Vendredi 11 decembre' (majuscule), '1 décembre'...
+    L'année manquante est complétée par `annee_defaut` (l'année demandée).
+    Renvoie None si le texte n'est pas une date reconnaissable."""
+    if isinstance(valeur, datetime):
+        return valeur.date()
+    if isinstance(valeur, date):
+        return valeur
+    if not valeur:
+        return None
+    mots = [m for m in re.findall(r'[a-z]+|\d+', _sans_accents(valeur)) if m != 'er']  # '1er' -> '1'
+    for i, mot in enumerate(mots):
+        if mot.isdigit() and i + 1 < len(mots) and mots[i + 1] in _MOIS_SANS_ACCENT:
+            jour, mois_num = int(mot), _MOIS_SANS_ACCENT[mots[i + 1]]
+            annee = annee_defaut
+            if i + 2 < len(mots) and mots[i + 2].isdigit() and len(mots[i + 2]) == 4:
+                annee = int(mots[i + 2])
+            if annee is None:
+                return None
+            try:
+                return date(annee, mois_num, jour)
+            except ValueError:
+                return None
+    return None
+
+
+def parse_calendrier_evenements(path, sheet_name, annee=None):
     """Le fichier est déjà dans le format cible (Date | Début | Fin | Nom |
-    Agents) — on le relit tel quel, sans interprétation, pour pouvoir le
+    Agents) — on le relit sans interpréter le contenu, pour pouvoir le
     fusionner avec les autres sources sans rien perdre de ce qui a déjà été
-    saisi à la main."""
+    saisi à la main.
+
+    CORRECTIF 14/10/2026 (demande utilisatrice : onglet Événements trié par
+    ordre chronologique) : la DATE, elle, est désormais convertie en vraie
+    date (cf. _date_depuis_texte). Avant, elle restait du texte libre
+    ('mardi 1 decembre', sans année ni accent) : impossible à trier, ces
+    lignes étaient toutes rejetées en fin d'onglet. Bonus : elles sont
+    réécrites au format standard 'mardi 1 décembre 2026', que le moteur
+    sait lire — auparavant 'decembre' sans accent n'était PAS reconnu par
+    le moteur (_parse_fr_date), et ces événements disparaissaient sans bruit
+    du planning généré. Une date illisible est gardée telle quelle, placée
+    en fin d'onglet et surlignée en jaune."""
     wb = load_workbook(path, data_only=True)
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Onglet '{sheet_name}' introuvable dans {path} "
@@ -700,7 +744,15 @@ def parse_calendrier_evenements(path, sheet_name):
         if not date_txt or not nom:
             continue
         agents = [normalize_agent(a) or a.strip() for a in str(agents_raw).split(';')] if agents_raw else []
-        events.append(_event(date_txt, debut, fin, str(nom).strip(), agents,
+        d = _date_depuis_texte(date_txt, annee)
+        if d is None:
+            events.append(_event(str(date_txt).strip(), debut, fin, str(nom).strip(), agents,
+                                  alert=True,
+                                  alert_reason="Date non reconnue (format attendu : "
+                                               "'mardi 1 décembre 2026') — à corriger.",
+                                  source='calendrier déjà saisi'))
+            continue
+        events.append(_event(d, debut, fin, str(nom).strip(), agents,
                               source='calendrier déjà saisi'))
     return events
 
@@ -738,7 +790,9 @@ def build_onglet_evenements(events, out_path, sheet_name='Événements'):
     def _heure_en_minutes(h):
         if not h:
             return 99999  # heure inconnue -> classée en dernier ce jour-là
-        m = re.match(r'(\d{1,2})h(\d{2})?', str(h).strip().lower())
+        if hasattr(h, 'hour') and hasattr(h, 'minute'):  # vraie heure Excel (10:00)
+            return h.hour * 60 + h.minute
+        m = re.match(r'(\d{1,2})\s*[h:](\d{2})?', str(h).strip().lower())
         if not m:
             return 99999
         heures = int(m.group(1))
@@ -787,7 +841,9 @@ def build_onglet_evenements(events, out_path, sheet_name='Événements'):
             reason = ev.get('alert_reason') or 'À compléter.'
             # Heure manquante -> on surligne Début/Fin
             cells_to_flag = []
-            if not ev['debut'] and not ev['fin']:
+            if not isinstance(d, date):
+                cells_to_flag = [1]  # date illisible -> on surligne la date
+            elif not ev['debut'] and not ev['fin']:
                 cells_to_flag = [2, 3]
             if not cells_to_flag:
                 cells_to_flag = [5]
@@ -795,6 +851,18 @@ def build_onglet_evenements(events, out_path, sheet_name='Événements'):
                 cell = ws.cell(row=row, column=col)
                 cell.fill = JAUNE
                 cell.comment = Comment(reason, "Assistant planning")
+
+        # Heure saisie mais illisible (ex. '19f' au lieu de '19h') : le moteur
+        # ignorerait l'événement entier sans prévenir → on le signale.
+        for col, h in ((2, ev['debut']), (3, ev['fin'])):
+            if h and _heure_en_minutes(h) == 99999:
+                cell = ws.cell(row=row, column=col)
+                cell.fill = JAUNE
+                cell.comment = Comment(
+                    f"Heure « {h} » non reconnue (format attendu : 10h, 14h30) — "
+                    "sans correction, l'événement n'apparaîtra pas dans le planning.",
+                    "Assistant planning")
+                n_alerts += 1
         row += 1
 
     for col, width in zip('ABCDE', [26, 10, 10, 24, 40]):
@@ -861,7 +929,7 @@ def generate_evenements(mois, annee, out_path, sources=None):
 
     if sources.get('calendrier'):
         path, sheet_name = sources['calendrier']
-        evs = parse_calendrier_evenements(path, sheet_name)
+        evs = parse_calendrier_evenements(path, sheet_name, annee)
         all_events += evs
         par_source['calendrier déjà saisi'] = len(evs)
 
